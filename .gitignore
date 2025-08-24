@@ -5,3 +5,6 @@ minio-data/
 .vscode/
 .venv/
 .DS_Store
+postgres-data/
+airflow/logs/
+__pycache__/

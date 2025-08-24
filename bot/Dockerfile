@@ -8,4 +8,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+ENV RUNNING_IN_DOCKER=true
 CMD ["python", "bot.py"]

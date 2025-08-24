@@ -5,6 +5,7 @@ from aiogram.filters import BaseFilter
 import logging
 from dotenv import load_dotenv
 from db import upload_to_minio, minio_client
+from db import init_db, save_media
 
 load_dotenv(dotenv_path='../.env')
 
@@ -39,22 +40,22 @@ async def handle_message(message: types.Message) -> None:
         file_data = await bot.download_file(file.file_path)
         file_bytes = file_data.read()
         
-        success = await upload_to_minio(file_bytes, file_name)
+        file_url = await upload_to_minio(file_bytes, file_name)
+
+        success = await save_media(chat_id, user.id, user_name, "photo", file_url)
         if success:
             logger.info(f"Successfully uploaded photo: {file_name}")
-        else:
-            logger.error(f"Failed to upload photo: {file_name}")
 
     if message.video:
         video = message.video
         file = await bot.get_file(video.file_id)
         file_name = f"video_{message.message_id}_{video.file_unique_id}.mp4"
         
-        # Download file as bytes
         file_data = await file.download_as_bytes()
         
-        # Upload to MinIO
-        success = await upload_to_minio(file_data, file_name)
+        file_url = await upload_to_minio(file_data, file_name)
+
+        success = await save_media(chat_id, user.id, user_name, "video", file_url)
         if success:
             logger.info(f"Successfully uploaded video: {file_name}")
         else:
@@ -62,6 +63,8 @@ async def handle_message(message: types.Message) -> None:
 
 async def main() -> None:
     """Main function to run the bot."""
+    logger.info("Initializing postgres")
+    await init_db()
     logger.info("Starting bot...")
     await dp.start_polling(bot, allowed_updates=["message"])
 

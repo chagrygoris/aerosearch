@@ -48,9 +48,10 @@ def init_minio_client():
 
 minio_client, bucket_name = init_minio_client()
 
-async def upload_to_minio(file_data: bytes, file_name: str) -> bool:
-    """Upload bytes directly to MinIO and return success status."""
+async def upload_to_minio(file_data: bytes, file_name: str) -> str:
+    """Upload bytes directly to MinIO and return the file URL."""
     try:
+        endpoint = os.getenv("MINIO_ENDPOINT")
         minio_client.put_object(
             bucket_name=bucket_name,
             object_name=file_name,
@@ -58,8 +59,8 @@ async def upload_to_minio(file_data: bytes, file_name: str) -> bool:
             length=len(file_data),
             part_size=5 * 1024 * 1024
         )
-        logger.info(f"Uploaded {file_name} to MinIO bucket {bucket_name}")
-        return True
+        file_url = f"{endpoint}/{bucket_name}/{file_name}"
+        logger.info(f"Uploaded {file_name} to MinIO: {file_url}")
+        return file_url
     except S3Error as e:
         logger.error(f"Failed to upload {file_name} to MinIO: {e}")
-        return False
