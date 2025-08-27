@@ -57,12 +57,13 @@ services:
       - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
       - MINIO_BUCKET=${MINIO_BUCKET}
       - TELEGRAM_BOT_TOKEN=${API_KEY}
+      - AIRFLOW__CORE__DAGS_FOLDER=/tmp/airflow/dags
       - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
     volumes:
-      - ./airflow/dags:/opt/airflow/dags
-      - ./airflow/logs:/opt/airflow/logs
-      - ./airflow/plugins:/opt/airflow/plugins
-      - ./bot:/opt/airflow/bot  # Share bot code for tasks
+      - ./airflow/dags:/tmp/airflow/dags
+      - ./airflow/logs:/tmp/airflow/logs
+      - ./airflow/plugins:/tmp/airflow/plugins
+      - ./bot:/tmp/airflow/bot  # Share bot code for tasks
     ports:
       - "8080:8080"  # Airflow web UI
     command: webserver
@@ -93,12 +94,13 @@ services:
       - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
       - MINIO_BUCKET=${MINIO_BUCKET}
       - TELEGRAM_BOT_TOKEN=${API_KEY}
+      - AIRFLOW__CORE__DAGS_FOLDER=/tmp/airflow/dags
       - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
     volumes:
-      - ./airflow/dags:/opt/airflow/dags
-      - ./airflow/logs:/opt/airflow/logs
-      - ./airflow/plugins:/opt/airflow/plugins
-      - ./bot:/opt/airflow/bot
+      - ./airflow/dags:/tmp/airflow/dags
+      - ./airflow/logs:/tmp/airflow/logs
+      - ./airflow/plugins:/tmp/airflow/plugins
+      - ./bot:/tmp/airflow/bot
     command: scheduler
     healthcheck:
       test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --local"]
