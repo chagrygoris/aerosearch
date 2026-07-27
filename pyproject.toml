@@ -1,0 +1,69 @@
+[project]
+name = "aerosearch"
+version = "0.1.0"
+description = "Multimodal semantic search over Telegram chat media (Gemma 3 + Whisper + pgvector)"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pillow>=10.0",
+    "python-dotenv>=1.0",
+    "typer>=0.12",
+    "rich>=13.0",
+]
+
+# CPU-only dev backends (embeddings, whisper) — runnable on the M2 dev box.
+# The heavy Gemma path lives in the `gpu` extra and targets the Kaggle T4.
+[project.optional-dependencies]
+# Bot query-side only: embed user queries with e5. No whisper/gemma.
+query = [
+    "sentence-transformers>=3.0",
+]
+# Telegram frontend: aiogram + the query-side embedder + blob/db clients.
+bot = [
+    "aiogram>=3.22",
+    "sentence-transformers>=3.0",
+    "asyncpg>=0.29",
+    "minio>=7.2",
+]
+# Full CPU inference set — what the Airflow batch worker runs (Gemma 3n E2B on
+# CPU needs transformers + timm; faster-whisper for speech; e5 for embeddings).
+cpu = [
+    "torch",
+    "transformers>=4.53",
+    "accelerate>=0.30",
+    "timm>=1.0",
+    "sentence-transformers>=3.0",
+    "faster-whisper>=1.0",
+]
+# CUDA/T4 path adds 4-bit quantization for the Gemma 3 4B captioner.
+gpu = [
+    "torch",
+    "transformers>=4.53",
+    "accelerate>=0.30",
+    "bitsandbytes>=0.43",
+    "timm>=1.0",
+    "sentence-transformers>=3.0",
+    "faster-whisper>=1.0",
+]
+db = [
+    "asyncpg>=0.29",
+    "minio>=7.2",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+aerosearch = "aerosearch.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aerosearch"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

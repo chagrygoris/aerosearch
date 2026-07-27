@@ -131,8 +131,8 @@ services:
 
   bot:
     build:
-      context: ./bot
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: bot/Dockerfile
     depends_on:
       minio:
         condition: service_healthy

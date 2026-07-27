@@ -1,6 +1,11 @@
 src/
 *.pyc
+src-videos/
+.venv/
 .env
+index/
+*.egg-info/
+.pytest_cache/
 minio-data/
 .vscode/
 .venv/
