@@ -18,9 +18,9 @@ run on a free Kaggle **T4** at 4-bit.
 
 ```
 media file ──▶ ffmpeg ──▶ frames ─────▶ Gemma (3n E2B / 3 4B) ─┐
-                     └──▶ 16k wav ──▶ faster-whisper ───────────┼─▶ fuse ─▶ e5 ─▶ pgvector
+                     └──▶ 16k wav ──▶ faster-whisper ───────────┼─▶ fuse ─▶ eg2 ─▶ pgvector
                                                                 ┘                    │
-query ─────────────────────────────────────────────────────────── e5 embed ─▶ cosine ┘
+query ───────────────────────────────────────────────────────── eg2 embed ─▶ cosine ┘
 ```
 
 ## Deployment (no always-on GPU)
@@ -30,9 +30,9 @@ The bot is thin; understanding runs on a **CPU batch schedule**:
 ```
 Telegram ─▶ bot ─▶ MinIO (media) + Postgres row w/ NULL embedding  (ingest, cheap)
                                     │
-              Airflow every 15m ─▶ BatchIndexer: Gemma 3n E2B (CPU) + Whisper + e5
+              Airflow every 15m ─▶ BatchIndexer: Whisper + EmbeddingGemma 2 (CPU)
                                     │            ─▶ writes embedding back
-Telegram ◀─ bot ◀─ /search ◀─ e5 query embed ◀─ pgvector cosine search  (bot only needs e5)
+Telegram ◀─ bot ◀─ /search ◀─ eg2 query embed ◀─ pgvector cosine search  (query-side only)
 ```
 
 - **Ingest** (`bot/bot.py`): captures photos, videos **and text messages**, uploads
@@ -40,7 +40,8 @@ Telegram ◀─ bot ◀─ /search ◀─ e5 query embed ◀─ pgvector cosine 
 - **Batch worker** (`aerosearch/batch.py`, DAG `airflow/dags/index_pending.py`):
   picks up NULL-embedding rows, understands + embeds them (Gemma 3n E2B on CPU),
   writes vectors back. Runs every 15 min.
-- **Search** (`/search <query>`): the only model the bot loads is e5 for the query.
+- **Search** (`/search <query>`): the only model the bot loads is EmbeddingGemma 2,
+  to embed the query.
 
 Captioner is chosen by model name: `AEROSEARCH_CAPTION_MODEL=google/gemma-3n-E2B-it`
 (CPU batch) or `google/gemma-3-4b-it` (T4 4-bit). Gemma 3n also hears audio, so
@@ -72,7 +73,7 @@ ranks sensibly — good for smoke tests and CI.
 ## Real models
 
 ```bash
-uv pip install --python .venv -e ".[cpu]"     # e5 + faster-whisper (M2 dev)
+uv pip install --python .venv -e ".[cpu]"     # EmbeddingGemma 2 + faster-whisper
 .venv/bin/aerosearch index src-videos --backend real   # captions are faked-off on CPU-only
 
 # Full vision path on a T4:
@@ -100,7 +101,7 @@ Run only the infra in Docker; run the bot from your venv. No Airflow, no gated
 Gemma download — you index manually and watch data land.
 
 ```bash
-# 0) Install the bot deps (aiogram + e5 + db/blob clients) into the venv
+# 0) Install the bot deps (aiogram + embedder + db/blob clients) into the venv
 uv pip install --python .venv -e ".[bot]"
 
 # 1) Start MinIO + Postgres only
@@ -122,18 +123,20 @@ MinIO + a *pending* Postgres row. A third terminal drains those rows:
 `worker` is the local stand-in for the Airflow DAG — same `BatchIndexer`, driven by
 a poll loop instead of a scheduler, so nothing but Postgres and MinIO needs to run.
 
-**Captions are off by default** (`--no-captions`). Gemma-class captioning needs a
-GPU to be practical — measured 9–16 s/clip on a T4 and several times that on CPU —
-so a local run indexes on speech plus filename hint, which is immediate, and leaves
-the vision pass to a GPU batch. `--captions` turns it on if you want to wait.
+**Captions are off by default** (`--no-captions`), and with EmbeddingGemma 2 that no
+longer costs you photo search: the embedder puts pixels in the same space as the
+query, so a photo is findable with no captioner in the loop. Measured on four
+synthetic images with Russian queries, cross-modal retrieval was 4/4 — including
+reading Cyrillic rendered *inside* an image (`политик Си Цзиньпинь` → the right image
+at 0.71). Two photos whose document text is identically `File: media.` now sit at
+cos 0.86 instead of being identical vectors, which is what made them unrankable under
+the text-only contract.
 
-⚠️ **Captions off means silent clips stay nearly invisible** — the exact gap the
-rebuild exists to close. Measured with the pinned embedder on three documents: the
-queries `политик про Винни-Пуха` (0.829) and `милые животные` (0.809) retrieved the
-right clip, but `танец без музыки` ranked a *silent* `macarena.mp4` last (0.738),
-because with no caption and no speech its document is only `File: macarena.` and
-there is nothing to match on. Run the GPU batch (or `--captions`) before trusting
-visual queries.
+`--captions` still adds a written description to `document`, which helps when you
+want the text itself (and the T4 benchmark showed Gemma reads on-screen text well),
+but it is enrichment now rather than the only route to a photo. Gemma-class
+captioning needs a GPU to be practical — 9–16 s/clip on a T4, several times that on
+CPU — so leave it to a GPU batch.
 
 Then search from Telegram with `/search <query>`.
 
@@ -161,8 +164,10 @@ index immediately.
 
 Stop everything: `docker compose down` (add `-v` to also wipe MinIO/Postgres data).
 
-> **Schema note:** the legacy `media` table was `vector(1536)`; e5-large is
-> **1024**. On a fresh DB the store creates the right schema. If you hit a
+> **Schema note:** the embedding column width follows the pinned contract —
+> legacy was `vector(1536)`, e5-large was **1024**, EmbeddingGemma 2 is **768**.
+> `init()` now checks the existing column and refuses with a clear message rather
+> than failing later on insert. On a fresh DB the store creates the right schema. If you hit a
 > dimension error on an existing volume, drop the table (or `docker compose down
 > -v`) and let it recreate.
 
@@ -218,11 +223,11 @@ ETA before launching.
 ## Pinned embeddings
 
 The embedding side is frozen in [`aerosearch/pinned.py`](aerosearch/pinned.py), because
-the embedding model, its revision, the e5 prefixes and the fusion layout together
-define the vector space every stored row lives in. Change one and new vectors land in
-a *different* space from the old ones: nothing raises, but similarity between an old
-row and a new query stops meaning anything, so it surfaces as mediocre ranking rather
-than as a bug.
+the embedding model, its revision, the prefixes, how images are fed in, and the fusion
+layout together define the vector space every stored row lives in. Change one and new
+vectors land in a *different* space from the old ones: nothing raises, but similarity
+between an old row and a new query stops meaning anything, so it surfaces as mediocre
+ranking rather than as a bug.
 
 ```bash
 .venv/bin/aerosearch pipeline     # print the contract + its fingerprint
@@ -230,22 +235,41 @@ than as a bug.
 
 | Setting | Value |
 |---|---|
-| `EMBED_MODEL` | `intfloat/multilingual-e5-large` |
-| `EMBED_REVISION` | `3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3` |
-| `EMBED_DIM` | 1024 |
-| prefixes | `passage: ` / `query: ` |
+| `EMBED_BACKEND` | `gemma2` |
+| `EMBED_MODEL` | `google/embeddinggemma-2` |
+| `EMBED_REVISION` | `f9972ac22e696a105c482202646979e33e4b5a1e` |
+| `EMBED_DIM` | 768 |
+| query prefix | `task: search result \| query: ` |
+| document prefix | `title: none \| text: ` |
+| `IMAGE_MODE` | `interleaved-v1` |
 | `FUSION_VERSION` | `fuse-v1` |
-| fingerprint | `43adcb174828` |
+| fingerprint | `e791e1812b81` |
 
-The revision is pinned to a commit SHA, not a branch: this repo has been reuploaded
-upstream before (that commit's own `lastModified` is 2026-04-02), and an unpinned
-re-download would move the space under an existing index silently. `E5Embedder`
-also refuses to run if the loaded model's width disagrees with `EMBED_DIM`, so a
-model swap fails loudly instead of writing mixed-geometry vectors.
+**Images share the text space**, which is the point: a photo is retrievable from a
+text query without being captioned first. Images carry *no* prefix and ride alongside
+the text with one `<|image|>` placeholder each; a row with both frames and speech gets
+a single interleaved vector rather than two averaged ones. Only the text encoder and
+the 170M vision encoder are loaded (440M) — the 300M audio encoder is switched off,
+since speech reaches the index through Whisper as text.
 
-Two indexes are comparable only if their fingerprints match. **Rows embedded before
-the pin went in may have used another revision**, so treat the current index as
-fingerprint-unknown and re-embed if ranking looks off.
+Revisions are commit SHAs, not branches. `embeddinggemma-2`'s own `lastModified` was
+the same day it was pinned here, so it is actively moving; an unpinned re-download
+would shift the space under an existing index silently. The embedder also refuses to
+run if the loaded model's width disagrees with `EMBED_DIM`, and `PgVectorStore.init()`
+refuses if an existing table's column width disagrees — a contract change is a
+re-embed, not a migration.
+
+### Rolling back to e5
+
+`multilingual-e5-large` is kept as a second contract because it is *known* strong on
+Russian, which EmbeddingGemma 2 is not yet independently proven to be:
+
+```bash
+AEROSEARCH_EMBED_BACKEND=e5      # 1024-dim, text only
+```
+
+That is a different space (and text-only, so photos go back to needing captions), so
+a rollback means re-embedding everything. The fingerprint changing is how you tell.
 
 Captioner and transcriber are deliberately *not* pinned: they change the `document`
 text a row carries, so a re-index yields a better document, but they do not change

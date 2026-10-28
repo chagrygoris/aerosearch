@@ -10,10 +10,24 @@ from .understanding.base import Captioner, Embedder, Transcriber
 
 
 def build_embedder(cfg: Config, backend: str = "real") -> Embedder:
+    """The embedder named by the pinned contract (aerosearch/pinned.py).
+
+    `gemma2` is multimodal, so photos are findable without a caption; `e5` is the
+    text-only fallback kept for its known Russian strength. They are different
+    vector spaces, so switching means re-embedding.
+    """
     if backend == "fake":
         from .understanding.fakes import FakeEmbedder
 
         return FakeEmbedder(dim=256)
+
+    from .pinned import EMBED_BACKEND
+
+    if EMBED_BACKEND == "gemma2":
+        from .understanding.embed_gemma2 import EmbeddingGemma2Embedder
+
+        return EmbeddingGemma2Embedder(cfg.model.embed_model)
+
     from .understanding.embed_e5 import E5Embedder
 
     return E5Embedder(cfg.model.embed_model)

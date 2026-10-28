@@ -11,7 +11,7 @@ from .fusion import fuse
 from .media import extract_media
 from .store.base import VectorStore
 from .types import MediaDocument
-from .understanding.base import Captioner, Embedder, Transcriber
+from .understanding.base import Captioner, Embedder, MultimodalEmbedder, Transcriber
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,15 @@ class Indexer:
             if extracted.audio_path:
                 transcript = self.transcriber.transcribe(extracted.audio_path)
 
-        doc = fuse(extracted, caption, transcript)
+            doc = fuse(extracted, caption, transcript)
+
+            # A multimodal embedder puts the pixels in the same space as the query,
+            # which is the only way a photo is findable without a caption. It has to
+            # happen here, inside the `with`, because the frames die with `wd`.
+            # Text-only rows are still embedded in a batch by the caller.
+            if extracted.frames and isinstance(self.embedder, MultimodalEmbedder):
+                doc.embedding = self.embedder.embed_media(doc.document, extracted.frames)
+
         for key in ("chat_id", "user_id", "user_name", "s3_url"):
             if key in provenance:
                 setattr(doc, key, provenance[key])
@@ -72,9 +80,13 @@ class Indexer:
         if not docs:
             return []
 
-        embeddings = self.embedder.embed_documents([d.document for d in docs])
-        for d, e in zip(docs, embeddings):
-            d.embedding = e
+        # Rows a multimodal embedder already handled (frames + text in one vector)
+        # carry an embedding; the rest are batched here, which is cheaper per row.
+        pending = [d for d in docs if d.embedding is None]
+        if pending:
+            embeddings = self.embedder.embed_documents([d.document for d in pending])
+            for d, e in zip(pending, embeddings):
+                d.embedding = e
 
         await self.store.init()
         await self.store.add(docs)

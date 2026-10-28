@@ -62,6 +62,28 @@ class PgVectorStore:
                 await conn.execute(
                     f"ALTER TABLE {self.table} ADD COLUMN IF NOT EXISTS {col} {decl};"
                 )
+            # CREATE TABLE IF NOT EXISTS silently leaves an existing column at its
+            # old width, so a contract change (e5 1024 -> EmbeddingGemma 2 768)
+            # would otherwise surface as an opaque pgvector insert error much later.
+            actual = await conn.fetchval(
+                """
+                SELECT a.atttypmod
+                FROM pg_attribute a
+                JOIN pg_class c ON c.oid = a.attrelid
+                WHERE c.relname = $1 AND a.attname = 'embedding' AND a.attnum > 0
+                """,
+                self.table,
+            )
+            if actual is not None and actual > 0 and actual != self.dim:
+                raise RuntimeError(
+                    f"table {self.table!r} has embedding vector({actual}) but the "
+                    f"pinned contract is {self.dim} dimensions. Vectors of different "
+                    f"widths cannot share a column, and the old ones are in a "
+                    f"different space anyway, so they must be re-embedded: drop the "
+                    f"table (or `docker compose down -v`) and let the worker rebuild "
+                    f"it. See aerosearch/pinned.py."
+                )
+
             await conn.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_{self.table}_chat_id "
                 f"ON {self.table} (chat_id);"

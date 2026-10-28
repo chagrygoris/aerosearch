@@ -104,9 +104,16 @@ class BatchIndexer:
         if not prepared:
             return 0
 
-        embeddings = self.embedder.embed_documents([d.document for _, d in prepared])
-        for (media_id, doc), emb in zip(prepared, embeddings):
-            doc.embedding = emb
+        # Media rows handled by a multimodal embedder already carry a vector built
+        # from their frames (see Indexer.understand); only the rest need embedding,
+        # and batching those is cheaper per row.
+        need = [(mid, d) for mid, d in prepared if d.embedding is None]
+        if need:
+            embeddings = self.embedder.embed_documents([d.document for _, d in need])
+            for (_, doc), emb in zip(need, embeddings):
+                doc.embedding = emb
+
+        for media_id, doc in prepared:
             await self.store.update_indexed(media_id, doc)
             logger.info("indexed row %s (%s)", media_id, doc.media_type)
 

@@ -62,3 +62,22 @@ class FakeEmbedder:
 
     def embed_query(self, text: str) -> list[float]:
         return self._embed_one(text)
+
+
+class FakeMultimodalEmbedder(FakeEmbedder):
+    """`FakeEmbedder` that also claims to embed pixels.
+
+    Exists so the multimodal routing in `Indexer.understand` is testable without
+    downloading EmbeddingGemma 2. Records each `embed_media` call so a test can
+    assert the frames actually reached the embedder rather than being dropped when
+    the temp dir closed.
+    """
+
+    def __init__(self, dim: int = 64):
+        super().__init__(dim=dim)
+        self.media_calls: list[tuple[str, int]] = []
+
+    def embed_media(self, text: str, images: list) -> list[float]:
+        self.media_calls.append((text, len(images)))
+        # Fold the frame count into the text so two different frame sets differ.
+        return self.embed_documents([f"{text} [frames={len(images)}]"])[0]
