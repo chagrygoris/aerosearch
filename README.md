@@ -163,6 +163,55 @@ Stop everything: `docker compose down` (add `-v` to also wipe MinIO/Postgres dat
 > dimension error on an existing volume, drop the table (or `docker compose down
 > -v`) and let it recreate.
 
+## Accelerator pool
+
+CPU captioning is too slow to be the plan (Gemma-class models decode at single-digit tokens/sec on
+CPU). Instead, GPU work is routed to whichever **Kaggle** account in our pool has spare weekly
+quota, using [`gpu_pool/`](gpu_pool/) — vendored from
+[`optimist1938/GA-Research`](https://github.com/optimist1938/GA-Research/tree/main/gpu_pool).
+Each account gets 30 GPU-hours/week; `router.py` reports who is free, `launcher.py` pushes a
+notebook there.
+
+```bash
+uv pip install --python .venv -e ".[pool]"     # the official Kaggle CLI; needs Python 3.11+
+export KAGGLE_TOKENS_DIR=~/pool_tokens
+
+python gpu_pool/router.py --no-kernels                    # quota table, ~1s per account
+python gpu_pool/router.py --best --idle-only --min-gpu-hours 6
+```
+
+**Credentials live outside the repo** — one directory per account holding a `token` file, pointed
+at by `KAGGLE_TOKENS_DIR` (conventionally `~/pool_tokens`). Never commit them; `.gitignore` blocks
+`*/token`, `kaggle*.json` and `*_tokens/` as a backstop. Full layout in
+[`gpu_pool/README.md`](gpu_pool/README.md).
+
+Launching, pinned to one account:
+
+```bash
+python gpu_pool/launcher.py --title aerosearch-gemma4-smoke \
+    --notebook notebooks/kaggle_gpu_batch.ipynb \
+    --accelerator t4 --min-hours 2 --account account8_PepeSchneyne --wait 3600
+```
+
+Outside a competition Kaggle offers only **T4** and **P100**; L4 and RTX Pro 6000 are granted by a
+specific competition and the router tracks which accounts can reach them
+(`python gpu_pool/router.py --competitions`). `--dry-run` prints the chosen account and the exact
+push body without touching Kaggle.
+
+### Two caveats for this repo
+
+- **aerosearch is private**, so `--repo https://github.com/chagrygoris/aerosearch.git` will fail to
+  clone on Kaggle. There is no secrets API, so a GitHub PAT has to be added **by hand** to each
+  account under *Add-ons → Secrets* and passed with `--github-token-secret`. For self-contained
+  experiments (e.g. benchmarking a captioner) prefer `--notebook`, which needs no clone, and ship
+  the benchmark clips as a Kaggle Dataset via `--dataset` since `src-videos/` is gitignored.
+- **`gpu_pool/rtx_monitor.py` does nothing here.** It replays offline W&B runs that print
+  `WANDB_SYNC` lines, a convention from GA-Research's `pose3d` trainer. Kept only so the folder
+  stays a faithful copy of upstream.
+
+Runs cannot be cancelled once pushed — neither the CLI nor the API exposes a cancel — so check the
+ETA before launching.
+
 ## Config
 
 Everything is env-driven (`aerosearch/config.py`): `AEROSEARCH_NUM_FRAMES`,

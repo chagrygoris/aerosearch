@@ -13,3 +13,11 @@ minio-data/
 postgres-data/
 airflow/logs/
 __pycache__/
+# Accelerator pool credentials - never commit these (see gpu_pool/README.md)
+kaggle.json
+kaggle*.json
+*/token
+**/token
+*_tokens/
+*_tokens_*/
+pool_tokens/

@@ -49,6 +49,12 @@ db = [
     "asyncpg>=0.29",
     "minio>=7.2",
 ]
+# Accelerator pool tooling (gpu_pool/): routes a run to whichever Kaggle account
+# has spare GPU quota. The official Kaggle CLI needs Python 3.11+, so this extra
+# is the one part of the project that won't install on 3.10.
+pool = [
+    "kaggle>=2.2",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
