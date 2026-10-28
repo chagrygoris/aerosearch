@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
+from .pinned import EMBED_DIM, EMBED_MODEL
+
 load_dotenv()
 
 
@@ -60,11 +62,12 @@ class ModelConfig:
     # faster-whisper size: "small"/"base" for CPU dev, "large-v3" on the T4.
     transcribe_model: str = field(default_factory=lambda: _str("AEROSEARCH_WHISPER_MODEL", "small"))
 
-    # multilingual-e5-large -> 1024-dim, strong on the Russian-heavy corpus.
-    embed_model: str = field(
-        default_factory=lambda: _str("AEROSEARCH_EMBED_MODEL", "intfloat/multilingual-e5-large")
-    )
-    embed_dim: int = field(default_factory=lambda: _int("AEROSEARCH_EMBED_DIM", 1024))
+    # Embedding model and width are PINNED in aerosearch/pinned.py, because they
+    # define the vector space every stored row lives in. The env vars remain as a
+    # deliberate escape hatch for experiments; overriding either one makes new
+    # vectors incomparable with everything already indexed, so re-embed if you do.
+    embed_model: str = field(default_factory=lambda: _str("AEROSEARCH_EMBED_MODEL", EMBED_MODEL))
+    embed_dim: int = field(default_factory=lambda: _int("AEROSEARCH_EMBED_DIM", EMBED_DIM))
 
 
 def _database_url() -> str:

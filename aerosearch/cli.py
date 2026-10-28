@@ -103,5 +103,100 @@ def search(
     console.print(table)
 
 
+@app.command()
+def pipeline():
+    """Print the pinned embedding contract and its fingerprint.
+
+    Two indexes agree only if their fingerprints match; see aerosearch/pinned.py.
+    """
+    from .pinned import describe
+
+    table = Table(title="Pinned embedding contract")
+    table.add_column("setting")
+    table.add_column("value")
+    for key, value in describe().items():
+        table.add_row(key, value)
+    console.print(table)
+
+    if describe()["embed_revision"] == "(unpinned)":
+        from .understanding.embed_e5 import E5Embedder
+
+        resolved = E5Embedder().resolved_revision()
+        if resolved:
+            console.print(
+                f"\n[yellow]Revision is unpinned.[/] Upstream currently serves "
+                f"[bold]{resolved}[/].\nFreeze it with "
+                f"[cyan]AEROSEARCH_EMBED_REVISION={resolved}[/] (or edit pinned.py), "
+                f"then re-run this command — the fingerprint will change, so do it "
+                f"before indexing anything you intend to keep."
+            )
+        else:
+            console.print(
+                "\n[yellow]Revision is unpinned[/] and could not be resolved "
+                "(offline, or the model is not downloaded yet)."
+            )
+
+
+@app.command()
+def worker(
+    once: bool = typer.Option(False, "--once", help="Drain pending rows once and exit"),
+    interval: int = typer.Option(60, help="Seconds between polls when looping"),
+    limit: int = typer.Option(50, help="Max rows per pass"),
+    captions: bool = typer.Option(
+        False, "--captions/--no-captions",
+        help="Run the vision captioner. Off by default: needs a GPU to be practical.",
+    ),
+    verbose: bool = typer.Option(True, "--verbose/--quiet", "-v"),
+):
+    """Index rows the bot left pending, against Postgres + MinIO.
+
+    The local stand-in for the Airflow DAG (`airflow/dags/index_pending.py`): same
+    BatchIndexer, driven by a plain poll loop instead of a scheduler, so a local
+    deployment needs only Postgres and MinIO running.
+    """
+    logging.basicConfig(level=logging.INFO if verbose else logging.WARNING)
+
+    from .batch import BatchIndexer
+    from .pinned import fingerprint
+    from .store.minio_source import MinioDownloader
+
+    cfg = load_config()
+    store_obj = get_pgvector_store(
+        cfg.store.database_url, table=cfg.store.table, dim=cfg.model.embed_dim
+    )
+    batch = BatchIndexer(
+        cfg,
+        captioner=build_captioner(cfg, "real" if captions else "none"),
+        transcriber=build_transcriber(cfg, "real"),
+        embedder=build_embedder(cfg, "real"),
+        store=store_obj,
+        downloader=MinioDownloader(),
+    )
+
+    console.print(
+        f"worker: captions=[cyan]{'on' if captions else 'off'}[/] "
+        f"whisper=[cyan]{cfg.model.transcribe_model}[/] "
+        f"embed=[cyan]{cfg.model.embed_model}[/] "
+        f"fingerprint=[cyan]{fingerprint()}[/]"
+    )
+
+    async def _run():
+        try:
+            while True:
+                n = await batch.run(limit=limit)
+                if n:
+                    console.print(f"[green]indexed {n} row(s)[/]")
+                if once:
+                    return n
+                await asyncio.sleep(interval)
+        finally:
+            await store_obj.close()
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        console.print("\nstopped")
+
+
 if __name__ == "__main__":
     app()

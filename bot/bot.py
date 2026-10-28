@@ -55,9 +55,33 @@ def _display_name(user: types.User) -> str:
 @dp.message(Command("start", "help"))
 async def handle_start(message: types.Message) -> None:
     await message.answer(
-        "👋 I index this chat's photos, videos and messages for semantic search.\n"
-        "Use /search <what you remember> to find media by meaning."
+        "👋 I index this chat's photos, videos and messages for semantic search.\n\n"
+        "/search <what you remember> — find media by meaning\n"
+        "/stats — how much is indexed vs still being processed"
     )
+
+
+@dp.message(Command("stats"))
+async def handle_stats(message: types.Message) -> None:
+    """What's indexed vs still waiting on the worker.
+
+    Ingest and indexing are separate processes, so a just-sent clip is searchable
+    only after the worker picks it up. This makes that visible instead of looking
+    like /search is broken.
+    """
+    c = await store.counts(chat_id=message.chat.id)
+    if not c["indexed"] and not c["pending"]:
+        await message.answer("Nothing from this chat yet. Send a photo, video or message.")
+        return
+
+    lines = [f"📊 <b>{c['indexed']}</b> searchable, <b>{c['pending']}</b> waiting to be indexed."]
+    for kind in ("photo", "video", "text"):
+        got, wait = c.get(f"{kind}_indexed", 0), c.get(f"{kind}_pending", 0)
+        if got or wait:
+            lines.append(f"  {kind}: {got} indexed, {wait} pending")
+    if c["pending"]:
+        lines.append("\nRun <code>aerosearch worker</code> to index the pending ones.")
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("search"))
@@ -108,7 +132,10 @@ async def handle_message(message: types.Message) -> None:
         video = message.video
         file = await bot.get_file(video.file_id)
         file_name = f"video_{message.message_id}_{video.file_unique_id}.mp4"
-        file_bytes = await file.download_as_bytes()
+        # aiogram 3's File has no download_* methods — go through the bot, same as
+        # the photo branch above. (Was File.download_as_bytes(), which never existed
+        # on aiogram 3 and crashed every video ingest.)
+        file_bytes = (await bot.download_file(file.file_path)).read()
         s3_url = await upload_to_minio(file_bytes, file_name)
         await store.add_pending(
             MediaDocument(source=file_name, media_type="video", s3_url=s3_url,

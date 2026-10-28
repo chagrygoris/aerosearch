@@ -111,26 +111,29 @@ cd bot && ../.venv/bin/python bot.py        # logs stream to this terminal
 ```
 
 Now DM your bot (or add it to a group) and send a photo/video/text. Each lands in
-MinIO + a *pending* Postgres row. Then index those rows yourself — no GPU needed
-for a smoke test with the fake captioner, or real Whisper/e5 for actual quality:
+MinIO + a *pending* Postgres row. A third terminal drains those rows:
 
 ```bash
-# understand + embed the pending rows straight into Postgres
-.venv/bin/python -c "
-import asyncio, os
-os.environ['AEROSEARCH_CAPTION_MODEL']='google/gemma-3-4b-it'  # captions skipped on CPU-only
-from aerosearch.batch import BatchIndexer
-from aerosearch.config import load_config
-from aerosearch.factory import build_captioner, build_embedder, build_transcriber
-from aerosearch.store import get_pgvector_store
-from aerosearch.store.minio_source import MinioDownloader
-cfg=load_config()
-store=get_pgvector_store(cfg.store.database_url, table=cfg.store.table, dim=cfg.model.embed_dim)
-b=BatchIndexer(cfg, build_captioner(cfg,'real'), build_transcriber(cfg,'real'),
-               build_embedder(cfg,'real'), store, MinioDownloader(endpoint='localhost:9000'))
-print('indexed', asyncio.run(b.run()))
-"
+# 3) Understand + embed pending rows, on a 60s poll loop
+.venv/bin/aerosearch worker                 # Ctrl-C to stop
+.venv/bin/aerosearch worker --once          # single pass, then exit
 ```
+
+`worker` is the local stand-in for the Airflow DAG — same `BatchIndexer`, driven by
+a poll loop instead of a scheduler, so nothing but Postgres and MinIO needs to run.
+
+**Captions are off by default** (`--no-captions`). Gemma-class captioning needs a
+GPU to be practical — measured 9–16 s/clip on a T4 and several times that on CPU —
+so a local run indexes on speech plus filename hint, which is immediate, and leaves
+the vision pass to a GPU batch. `--captions` turns it on if you want to wait.
+
+⚠️ **Captions off means silent clips stay nearly invisible** — the exact gap the
+rebuild exists to close. Measured with the pinned embedder on three documents: the
+queries `политик про Винни-Пуха` (0.829) and `милые животные` (0.809) retrieved the
+right clip, but `танец без музыки` ranked a *silent* `macarena.mp4` last (0.738),
+because with no caption and no speech its document is only `File: macarena.` and
+there is nothing to match on. Run the GPU batch (or `--captions`) before trusting
+visual queries.
 
 Then search from Telegram with `/search <query>`.
 
@@ -211,6 +214,42 @@ push body without touching Kaggle.
 
 Runs cannot be cancelled once pushed — neither the CLI nor the API exposes a cancel — so check the
 ETA before launching.
+
+## Pinned embeddings
+
+The embedding side is frozen in [`aerosearch/pinned.py`](aerosearch/pinned.py), because
+the embedding model, its revision, the e5 prefixes and the fusion layout together
+define the vector space every stored row lives in. Change one and new vectors land in
+a *different* space from the old ones: nothing raises, but similarity between an old
+row and a new query stops meaning anything, so it surfaces as mediocre ranking rather
+than as a bug.
+
+```bash
+.venv/bin/aerosearch pipeline     # print the contract + its fingerprint
+```
+
+| Setting | Value |
+|---|---|
+| `EMBED_MODEL` | `intfloat/multilingual-e5-large` |
+| `EMBED_REVISION` | `3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3` |
+| `EMBED_DIM` | 1024 |
+| prefixes | `passage: ` / `query: ` |
+| `FUSION_VERSION` | `fuse-v1` |
+| fingerprint | `43adcb174828` |
+
+The revision is pinned to a commit SHA, not a branch: this repo has been reuploaded
+upstream before (that commit's own `lastModified` is 2026-04-02), and an unpinned
+re-download would move the space under an existing index silently. `E5Embedder`
+also refuses to run if the loaded model's width disagrees with `EMBED_DIM`, so a
+model swap fails loudly instead of writing mixed-geometry vectors.
+
+Two indexes are comparable only if their fingerprints match. **Rows embedded before
+the pin went in may have used another revision**, so treat the current index as
+fingerprint-unknown and re-embed if ranking looks off.
+
+Captioner and transcriber are deliberately *not* pinned: they change the `document`
+text a row carries, so a re-index yields a better document, but they do not change
+the geometry, and old and new rows stay comparable.
 
 ## Config
 

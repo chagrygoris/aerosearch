@@ -143,6 +143,37 @@ class PgVectorStore:
             )
         return [dict(r) for r in records]
 
+    async def counts(self, chat_id: Optional[int] = None) -> dict[str, int]:
+        """How many rows are indexed vs still pending, by media type.
+
+        Backs the bot's /stats. Ingest and indexing are deliberately separate here,
+        so "I sent it and /search finds nothing" is the expected state until the
+        worker catches up — this is how you tell that apart from a real failure.
+        """
+        pool = await self._get_pool()
+        where, params = "", []
+        if chat_id is not None:
+            where, params = "WHERE chat_id = $1", [chat_id]
+        async with pool.acquire() as conn:
+            records = await conn.fetch(
+                f"""
+                SELECT media_type,
+                       count(*) FILTER (WHERE embedding IS NOT NULL) AS indexed,
+                       count(*) FILTER (WHERE embedding IS NULL)     AS pending
+                FROM {self.table}
+                {where}
+                GROUP BY media_type
+                """,
+                *params,
+            )
+        out: dict[str, int] = {"indexed": 0, "pending": 0}
+        for r in records:
+            out["indexed"] += r["indexed"]
+            out["pending"] += r["pending"]
+            out[f"{r['media_type']}_indexed"] = r["indexed"]
+            out[f"{r['media_type']}_pending"] = r["pending"]
+        return out
+
     async def update_indexed(self, media_id: int, doc: MediaDocument) -> None:
         """Write the understood text + embedding back onto an existing row."""
         if doc.embedding is None:

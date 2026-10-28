@@ -24,6 +24,11 @@ def build_captioner(cfg: Config, backend: str = "real") -> Captioner:
         from .understanding.fakes import FakeCaptioner
 
         return FakeCaptioner()
+    if backend == "none":
+        # Vision off: no model loaded, no text contributed. The local-Mac default.
+        from .understanding.null import NullCaptioner
+
+        return NullCaptioner()
 
     name = cfg.model.caption_model
     # Gemma 3n (E2B/E4B) — small, multimodal, CPU-friendly for the Airflow batch.
