@@ -23,3 +23,16 @@ class NullCaptioner:
 
     def caption(self, frames: list["Image"], media_type: str) -> str:
         return ""
+
+
+class NullTranscriber:
+    """Transcriber that returns nothing — ASR switched off.
+
+    The baseline embeds speech audio straight into the retrieval space, so no
+    transcript is needed to find a spoken clip. Returning "" means `fusion.fuse`
+    omits the "Speech:" line rather than inserting a placeholder that would be
+    embedded as if it were content.
+    """
+
+    def transcribe(self, audio_path: str) -> str:
+        return ""

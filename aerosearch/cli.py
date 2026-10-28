@@ -39,6 +39,10 @@ def index(
     backend: str = typer.Option("fake", help="fake | real"),
     store: str = typer.Option("memory", help="memory | pg"),
     store_path: str = typer.Option(DEFAULT_STORE_PATH, help="memory store base path"),
+    enrich: bool = typer.Option(
+        False, "--enrich/--no-enrich",
+        help="Also run the captioner + Whisper (needs a GPU to be practical).",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):
     """Understand + embed + store every media file under PATH."""
@@ -51,12 +55,16 @@ def index(
         raise typer.Exit(1)
 
     console.print(f"Indexing [bold]{len(paths)}[/] file(s) with backend=[cyan]{backend}[/]…")
+    # backend="fake" keeps the offline smoke path; otherwise the baseline is the
+    # embedder alone, with caption/ASR only under --enrich.
+    aux = backend if backend == "fake" else ("real" if enrich else "none")
     indexer = Indexer(
         cfg,
-        captioner=build_captioner(cfg, backend),
-        transcriber=build_transcriber(cfg, backend),
+        captioner=build_captioner(cfg, aux),
+        transcriber=build_transcriber(cfg, aux),
         embedder=build_embedder(cfg, backend),
         store=_make_store(store, store_path, cfg.model.embed_dim),
+        enrich=enrich or backend == "fake",
     )
 
     async def _run():
@@ -142,9 +150,10 @@ def worker(
     once: bool = typer.Option(False, "--once", help="Drain pending rows once and exit"),
     interval: int = typer.Option(60, help="Seconds between polls when looping"),
     limit: int = typer.Option(50, help="Max rows per pass"),
-    captions: bool = typer.Option(
-        False, "--captions/--no-captions",
-        help="Run the vision captioner. Off by default: needs a GPU to be practical.",
+    enrich: bool = typer.Option(
+        False, "--enrich/--no-enrich",
+        help="Also run the captioner + Whisper. Off by default: the embedder covers "
+             "images, video and audio on its own, and these need a GPU to be practical.",
     ),
     verbose: bool = typer.Option(True, "--verbose/--quiet", "-v"),
 ):
@@ -153,6 +162,9 @@ def worker(
     The local stand-in for the Airflow DAG (`airflow/dags/index_pending.py`): same
     BatchIndexer, driven by a plain poll loop instead of a scheduler, so a local
     deployment needs only Postgres and MinIO running.
+
+    By default EmbeddingGemma 2 is the only model: a media file goes straight to it,
+    so photos and spoken clips are retrievable with no captioner and no ASR.
     """
     logging.basicConfig(level=logging.INFO if verbose else logging.WARNING)
 
@@ -166,17 +178,17 @@ def worker(
     )
     batch = BatchIndexer(
         cfg,
-        captioner=build_captioner(cfg, "real" if captions else "none"),
-        transcriber=build_transcriber(cfg, "real"),
+        captioner=build_captioner(cfg, "real" if enrich else "none"),
+        transcriber=build_transcriber(cfg, "real" if enrich else "none"),
         embedder=build_embedder(cfg, "real"),
         store=store_obj,
         downloader=MinioDownloader(),
+        enrich=enrich,
     )
 
     console.print(
-        f"worker: captions=[cyan]{'on' if captions else 'off'}[/] "
-        f"whisper=[cyan]{cfg.model.transcribe_model}[/] "
-        f"embed=[cyan]{cfg.model.embed_model}[/] "
+        f"worker: embed=[cyan]{cfg.model.embed_model}[/] "
+        f"enrich=[cyan]{'on (caption + whisper)' if enrich else 'off (embedder only)'}[/] "
         f"fingerprint=[cyan]{fingerprint()}[/]"
     )
 

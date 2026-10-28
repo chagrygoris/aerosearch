@@ -76,8 +76,18 @@ class FakeMultimodalEmbedder(FakeEmbedder):
     def __init__(self, dim: int = 64):
         super().__init__(dim=dim)
         self.media_calls: list[tuple[str, int]] = []
+        self.file_calls: list[tuple[str, str]] = []
 
     def embed_media(self, text: str, images: list) -> list[float]:
         self.media_calls.append((text, len(images)))
         # Fold the frame count into the text so two different frame sets differ.
         return self.embed_documents([f"{text} [frames={len(images)}]"])[0]
+
+    def embed_file(self, path: str, media_type: str, text: str = "") -> list[float]:
+        """Stands in for handing the raw file to the model.
+
+        Hashes the path so two different files differ even when their `document`
+        text is identical -- the property the real embedder provides via pixels.
+        """
+        self.file_calls.append((path, media_type))
+        return self.embed_documents([f"{media_type}:{path}"])[0]

@@ -13,10 +13,16 @@ string you can store next to an index and compare later.
 
 ## Two backends, one active
 
-`gemma2` (**active**) is EmbeddingGemma 2: text *and images* in one 768-dim
+`gemma2` (**active**) is EmbeddingGemma 2, and it is the *only* model in the
+retrieval path. Text, images, video and audio all go into one 768-dim
 cosine-comparable space, so a photo is retrievable from a text query without being
-captioned first. That is the point of it — the captioner needs a GPU to be practical,
-and without it a photo's document was just `File: media.` and nothing could match.
+captioned and a spoken clip without being transcribed. No captioner, no ASR, not even
+ffmpeg: the media file is handed to the embedder as it is.
+
+That is the whole baseline. A captioner (Gemma) and a transcriber (Whisper) remain
+wired up behind `--enrich`, because they add *readable text* to a row and may retrieve
+specific phrasing better than a 768-float summary of the audio — but they are an
+experiment to justify by measurement, not part of the default path.
 
 `e5` is the previous contract, multilingual-e5-large at 1024 dim, text only. It is
 kept because it is *known* strong on Russian, which EmbeddingGemma 2 is not yet
@@ -60,9 +66,10 @@ _CONTRACTS: dict[str, dict] = {
         # strings are recorded so they are part of the fingerprint.
         "query_prefix": "task: search result | query: ",
         "doc_prefix": "title: none | text: ",
-        # Images carry NO prefix and are passed alongside the text, with one
-        # "<|image|>" placeholder per image. See embed_gemma2.py.
-        "image_mode": "interleaved-v1",
+        # One model for every modality: images, video and audio go straight to
+        # the embedder, no prefix, no captioner and no ASR in the retrieval path.
+        # See embed_gemma2.py.
+        "media_mode": "av-direct-v1",
     },
     "e5": {
         "model": "intfloat/multilingual-e5-large",
@@ -70,7 +77,7 @@ _CONTRACTS: dict[str, dict] = {
         "dim": 1024,
         "query_prefix": "query: ",
         "doc_prefix": "passage: ",
-        "image_mode": "none",  # text only; photos need a caption to be findable
+        "media_mode": "none",  # text only; media needs a caption/transcript to be findable
     },
 }
 
@@ -87,11 +94,12 @@ EMBED_REVISION: str | None = os.getenv("AEROSEARCH_EMBED_REVISION") or _ACTIVE["
 EMBED_DIM: int = _ACTIVE["dim"]
 QUERY_PREFIX: str = _ACTIVE["query_prefix"]
 PASSAGE_PREFIX: str = _ACTIVE["doc_prefix"]
-IMAGE_MODE: str = _ACTIVE["image_mode"]
+MEDIA_MODE: str = _ACTIVE["media_mode"]
 
-#: True when the active contract can embed pixels straight into the same space,
-#: which is what lets a photo be found without a caption.
-EMBEDS_IMAGES: bool = IMAGE_MODE != "none"
+#: True when the active contract embeds raw media (pixels, audio) straight into the
+#: same space as the query. That is what lets a photo be found without a caption and
+#: a spoken clip without a transcript.
+EMBEDS_MEDIA: bool = MEDIA_MODE != "none"
 
 #: Layout `fusion.fuse` writes ("File: … / Visual: … / Speech: …"). Bump on any
 #: change to that layout, since it changes the text the embedder sees.
@@ -110,7 +118,7 @@ def fingerprint() -> str:
         str(EMBED_DIM),
         PASSAGE_PREFIX,
         QUERY_PREFIX,
-        IMAGE_MODE,
+        MEDIA_MODE,
         FUSION_VERSION,
     ]
     return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()[:12]
@@ -125,8 +133,8 @@ def describe() -> dict[str, str]:
         "embed_dim": str(EMBED_DIM),
         "passage_prefix": PASSAGE_PREFIX,
         "query_prefix": QUERY_PREFIX,
-        "image_mode": IMAGE_MODE,
-        "embeds_images": str(EMBEDS_IMAGES),
+        "media_mode": MEDIA_MODE,
+        "embeds_media": str(EMBEDS_MEDIA),
         "fusion_version": FUSION_VERSION,
         "fingerprint": fingerprint(),
     }

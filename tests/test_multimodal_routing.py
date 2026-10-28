@@ -1,9 +1,12 @@
-"""Frames must reach a multimodal embedder before the temp dir closes.
+"""One model, every modality: the baseline hands the file to the embedder.
 
-This is the whole mechanism behind Option A. `Indexer.understand` extracts frames
-into a `TemporaryDirectory` and the PIL images die with it, so if embedding waited
-until the batching step in `index_paths` (as it did for the text-only e5 contract)
-the pixels would be gone and a photo would again be searchable only via its caption.
+With `enrich=False` (the default) `Indexer.understand` does no frame sampling, no
+captioning and no ASR — it calls `embed_file(path, media_type)` and stores the
+result. `enrich=True` restores the old path, where frames are extracted and a
+caption/transcript is fused into `document` before embedding.
+
+The distinction is the whole architecture, so it is asserted here rather than
+assumed.
 """
 import shutil
 
@@ -11,17 +14,16 @@ import pytest
 from PIL import Image
 
 from aerosearch.config import load_config
-from aerosearch.pipeline import Indexer
+from aerosearch.pipeline import Indexer, media_type_of
 from aerosearch.store.memory import MemoryVectorStore
 from aerosearch.understanding.base import Embedder, MultimodalEmbedder
 from aerosearch.understanding.fakes import (
+    FakeCaptioner,
     FakeEmbedder,
     FakeMultimodalEmbedder,
     FakeTranscriber,
 )
-from aerosearch.understanding.null import NullCaptioner
-
-pytestmark = pytest.mark.skipif(shutil.which("ffprobe") is None, reason="ffmpeg not installed")
+from aerosearch.understanding.null import NullCaptioner, NullTranscriber
 
 
 @pytest.fixture
@@ -31,47 +33,80 @@ def photo(tmp_path):
     return str(p)
 
 
-def _indexer(embedder, tmp_path):
+def _indexer(embedder, tmp_path, enrich=False, captioner=None, transcriber=None):
     return Indexer(
         load_config(),
-        captioner=NullCaptioner(),      # captions off: the local default
-        transcriber=FakeTranscriber(),
+        captioner=captioner or NullCaptioner(),
+        transcriber=transcriber or NullTranscriber(),
         embedder=embedder,
         store=MemoryVectorStore(path=str(tmp_path / "store")),
+        enrich=enrich,
     )
+
+
+def test_media_type_from_extension_needs_no_ffprobe():
+    assert media_type_of("a/b/c.JPG") == "photo"
+    assert media_type_of("x.png") == "photo"
+    assert media_type_of("clip.mp4") == "video"
+    assert media_type_of("clip.webm") == "video"
 
 
 def test_protocol_tells_the_two_embedders_apart():
     assert isinstance(FakeMultimodalEmbedder(), MultimodalEmbedder)
     assert isinstance(FakeMultimodalEmbedder(), Embedder)
     # A text-only embedder must NOT satisfy the multimodal protocol, or the
-    # pipeline would hand it frames it cannot use.
+    # pipeline would hand it media it cannot use.
     assert not isinstance(FakeEmbedder(), MultimodalEmbedder)
 
 
-def test_multimodal_embedder_receives_the_frames(photo, tmp_path):
+def test_baseline_hands_the_file_straight_to_the_embedder(photo, tmp_path):
     emb = FakeMultimodalEmbedder()
     doc = _indexer(emb, tmp_path).understand(photo)
 
-    assert emb.media_calls, "frames never reached the embedder"
-    _text, n_frames = emb.media_calls[0]
-    assert n_frames == 1
-    # Embedded during understand(), while the frames were still alive.
+    assert emb.file_calls == [(photo, "photo")], "baseline should call embed_file"
+    assert not emb.media_calls, "baseline must not extract frames"
     assert doc.embedding is not None and len(doc.embedding) == emb.dim
+    # document is only for display now; retrieval does not depend on it.
+    assert doc.document == "shot"
+    assert doc.media_type == "photo"
 
 
-def test_text_only_embedder_leaves_embedding_for_the_batch_step(photo, tmp_path):
+def test_baseline_runs_no_captioner_and_no_asr(photo, tmp_path):
+    """A captioner/transcriber handed in are ignored unless enrich=True."""
+    cap, tr = FakeCaptioner(), FakeTranscriber()
+    doc = _indexer(FakeMultimodalEmbedder(), tmp_path, captioner=cap, transcriber=tr).understand(photo)
+    # FakeCaptioner would have injected "[fake-caption ...]" into the document.
+    assert "fake-caption" not in doc.document
+    assert "Visual:" not in doc.document
+
+
+@pytest.mark.skipif(shutil.which("ffprobe") is None, reason="ffmpeg not installed")
+def test_enrich_restores_frame_extraction_and_fusion(photo, tmp_path):
+    emb = FakeMultimodalEmbedder()
+    doc = _indexer(emb, tmp_path, enrich=True, captioner=FakeCaptioner()).understand(photo)
+
+    assert emb.media_calls, "enrich should extract frames and call embed_media"
+    assert not emb.file_calls
+    assert "fake-caption" in doc.document, "caption should be fused into the document"
+
+
+def test_text_only_embedder_still_uses_the_enriched_path(photo, tmp_path):
+    """e5 rollback: no embed_file, so it must fall back to extract + fuse."""
     emb = FakeEmbedder(dim=64)
-    doc = _indexer(emb, tmp_path).understand(photo)
-    assert doc.embedding is None, "text-only path should defer to batched embedding"
+    idx = _indexer(emb, tmp_path)
+    if shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg not installed")
+    doc = idx.understand(photo)
+    # Embedding is deferred to the batched step for text-only embedders.
+    assert doc.embedding is None
 
 
-async def test_two_photos_with_identical_text_get_different_vectors(tmp_path):
-    """The failure Option A fixes.
+async def test_two_photos_with_identical_display_text_get_different_vectors(tmp_path):
+    """The failure this architecture fixes.
 
-    With captions off every photo's document is the same string, so a text-only
-    embedder maps them to the *identical* vector and no query can rank them. A
-    multimodal embedder sees the pixels, so the rows differ.
+    Under the text-only contract every photo's document was the same string, so the
+    embedder mapped them to the *identical* vector and no query could rank them.
+    Embedding the file itself makes the rows differ.
     """
     red, blue = tmp_path / "a.png", tmp_path / "b.png"
     Image.new("RGB", (64, 48), "red").save(red)
@@ -82,9 +117,9 @@ async def test_two_photos_with_identical_text_get_different_vectors(tmp_path):
     assert same[0] == same[1], "precondition: identical text embeds identically"
 
     emb = FakeMultimodalEmbedder()
-    idx = _indexer(emb, tmp_path)
-    docs = await idx.index_paths([str(red), str(blue)])
+    docs = await _indexer(emb, tmp_path).index_paths([str(red), str(blue)])
 
     assert len(docs) == 2
     assert all(d.embedding is not None for d in docs)
-    assert len(emb.media_calls) == 2, "both photos should go through embed_media"
+    assert len(emb.file_calls) == 2
+    assert docs[0].embedding != docs[1].embedding

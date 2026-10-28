@@ -9,19 +9,29 @@ so you can search the chat's media by meaning.
 
 The original (summer 2025) prototype understood **audio only** (Whisper →
 `multilingual-e5` → cosine). A silent Macarena dance or a Xi Jinping clip with no
-transcribable speech was invisible. The rebuild adds a small **multimodal** model
-— **Gemma 3 4B** (the smallest multimodal Gemma 3; 1B is text-only) — that looks
-at sampled frames and describes the visuals + any on-screen text. It's sized to
-run on a free Kaggle **T4** at 4-bit.
+transcribable speech was invisible, because nothing in the pipeline ever looked at
+the pixels.
+
+The fix turned out not to be more models but one better one. **EmbeddingGemma 2**
+puts text, images, video and audio in a single 768-dim space, so a text query
+reaches the pixels and the speech directly and the whole understand-then-embed
+stage disappears. Measured end to end on CPU with no captioner and no ASR: 4/4 on a
+mixed set — a spoken clip found from "speech about the government", an image found
+from the Russian text rendered inside it.
 
 ## Pipeline
 
 ```
-media file ──▶ ffmpeg ──▶ frames ─────▶ Gemma (3n E2B / 3 4B) ─┐
-                     └──▶ 16k wav ──▶ faster-whisper ───────────┼─▶ fuse ─▶ eg2 ─▶ pgvector
-                                                                ┘                    │
-query ───────────────────────────────────────────────────────── eg2 embed ─▶ cosine ┘
+media file (photo / video+audio) ──▶ EmbeddingGemma 2 ──▶ 768-d vector ──▶ pgvector
+                                             ▲                                  │
+query text ──────────────────────────────────┘────────────────────── cosine ─────┘
 ```
+
+One model, every modality. A media file is handed to the embedder as it is — no
+frame sampling, no captioning, no ASR, no ffmpeg in the retrieval path. A captioner
+(Gemma) and a transcriber (Whisper) remain available behind `--enrich` for when you
+want the words as *readable text*, but they are an experiment to justify by
+measurement rather than part of the default path.
 
 ## Deployment (no always-on GPU)
 
@@ -123,20 +133,28 @@ MinIO + a *pending* Postgres row. A third terminal drains those rows:
 `worker` is the local stand-in for the Airflow DAG — same `BatchIndexer`, driven by
 a poll loop instead of a scheduler, so nothing but Postgres and MinIO needs to run.
 
-**Captions are off by default** (`--no-captions`), and with EmbeddingGemma 2 that no
-longer costs you photo search: the embedder puts pixels in the same space as the
-query, so a photo is findable with no captioner in the loop. Measured on four
-synthetic images with Russian queries, cross-modal retrieval was 4/4 — including
-reading Cyrillic rendered *inside* an image (`политик Си Цзиньпинь` → the right image
-at 0.71). Two photos whose document text is identically `File: media.` now sit at
-cos 0.86 instead of being identical vectors, which is what made them unrankable under
-the text-only contract.
+**No captioner and no Whisper by default.** EmbeddingGemma 2 embeds the media file
+itself, so a photo is findable without a caption and a spoken clip without a
+transcript. Measured end to end on CPU with `NullCaptioner` + `NullTranscriber`,
+4/4 on a mixed set of photos and clips:
 
-`--captions` still adds a written description to `document`, which helps when you
-want the text itself (and the T4 benchmark showed Gemma reads on-screen text well),
-but it is enrichment now rather than the only route to a photo. Gemma-class
-captioning needs a GPU to be practical — 9–16 s/clip on a T4, several times that on
-CPU — so leave it to a GPU batch.
+| query | retrieved | score |
+|---|---|---|
+| `a cat sleeping on a sofa` | the clip whose *speech* says so | 0.756 |
+| `speech about the government` | the other spoken clip | 0.776 |
+| `политик Си Цзиньпинь` | the image with that Cyrillic text in it | 0.707 |
+| `colour bars test card` | the silent clip | 0.742 |
+
+`--enrich` adds the captioner and Whisper back. That buys *readable* text in
+`document` and may retrieve specific phrasing better than a 768-float summary of the
+audio — worth measuring, but it is not needed for retrieval to work, and both models
+want a GPU to be practical.
+
+⚠️ **Throughput on CPU is the real constraint.** Indexing 4 short files took **216 s**
+(~54 s/file, including model load) on this container's CPU. Video is the expensive
+part. sentence-transformers also warns that the model loads in `bfloat16` on CPU and
+that `float32` may be significantly faster there — untested, and worth trying on the
+Mac before concluding local indexing is too slow.
 
 Then search from Telegram with `/search <query>`.
 
@@ -241,16 +259,26 @@ ranking rather than as a bug.
 | `EMBED_DIM` | 768 |
 | query prefix | `task: search result \| query: ` |
 | document prefix | `title: none \| text: ` |
-| `IMAGE_MODE` | `interleaved-v1` |
+| `MEDIA_MODE` | `av-direct-v1` |
 | `FUSION_VERSION` | `fuse-v1` |
-| fingerprint | `e791e1812b81` |
+| fingerprint | `5fe9500239c2` |
 
-**Images share the text space**, which is the point: a photo is retrievable from a
-text query without being captioned first. Images carry *no* prefix and ride alongside
-the text with one `<|image|>` placeholder each; a row with both frames and speech gets
-a single interleaved vector rather than two averaged ones. Only the text encoder and
-the 170M vision encoder are loaded (440M) — the 300M audio encoder is switched off,
-since speech reaches the index through Whisper as text.
+**All modalities share the text space**, which is the point: a photo is retrievable
+without being captioned and a spoken clip without being transcribed. Media carries
+*no* prefix and is passed by its own key. The full 740M model is loaded — text,
+vision *and* audio — because speech is embedded directly rather than transcribed.
+
+One API detail that is load-bearing: `{"video": path}` alone does **not** pull in the
+file's audio track. On a clip of synthesized speech over a test pattern, "a cat
+sleeping" scored 0.626 video-only versus **0.729** with `audio` passed as well, so
+`embed_file` passes both keys and falls back to video-only when a file has no
+decodable audio. Audio wants mono 16 kHz; `librosa` is required for wav and
+`torchcodec` for audio inside an mp4.
+
+Budget is 8192 tokens shared across all inputs — 140 per video frame at 1 fps (~58
+frames), 25 per audio second (~327 s). Longer inputs were accepted without error in
+testing (400 s of audio embedded fine), so assume silent truncation rather than a
+raised limit.
 
 Revisions are commit SHAs, not branches. `embeddinggemma-2`'s own `lastModified` was
 the same day it was pinned here, so it is actively moving; an unpinned re-download

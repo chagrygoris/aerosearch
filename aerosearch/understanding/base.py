@@ -34,15 +34,21 @@ class Embedder(Protocol):
 
 @runtime_checkable
 class MultimodalEmbedder(Protocol):
-    """An `Embedder` that also puts *pixels* in the same space as the text.
+    """An `Embedder` that puts raw media in the same space as the text.
 
     The distinction matters: with a text-only embedder a photo is findable only
-    through a caption, so no captioner means nothing to match on. A multimodal one
-    embeds the frames directly, so a text query reaches the image itself.
+    through a caption and a spoken clip only through a transcript, so without those
+    models there is nothing to match on. A multimodal one embeds the pixels and the
+    audio themselves.
 
-    `embed_media` returns ONE vector for a row that has both frames and text (a clip
-    with speech, say), because a row holds a single vector. Implementations
-    interleave the two rather than averaging two separate embeddings.
+    `embed_file` is the baseline: hand it the file, get the vector. Nothing is
+    extracted, captioned or transcribed first, so this is the whole retrieval path
+    for media.
+
+    `embed_media` is the enriched variant, for when frames have already been sampled
+    and a caption or transcript exists. It returns ONE vector, because a row holds a
+    single vector — implementations interleave text and frames rather than averaging
+    two separate embeddings.
     """
 
     dim: int
@@ -50,5 +56,7 @@ class MultimodalEmbedder(Protocol):
     def embed_documents(self, texts: list[str]) -> list[list[float]]: ...
 
     def embed_query(self, text: str) -> list[float]: ...
+
+    def embed_file(self, path: str, media_type: str, text: str = "") -> list[float]: ...
 
     def embed_media(self, text: str, images: list["Image"]) -> list[float]: ...

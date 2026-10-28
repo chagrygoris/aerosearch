@@ -45,13 +45,16 @@ class BatchIndexer:
         embedder: Embedder,
         store: PendingStore,
         downloader: Optional[Downloader] = None,
+        enrich: bool = False,
     ):
         self.cfg = cfg
         self.embedder = embedder
         self.store = store
         self.downloader = downloader
-        # Reuse the single-file understanding logic for media rows.
-        self._indexer = Indexer(cfg, captioner, transcriber, embedder, store)  # type: ignore[arg-type]
+        self.enrich = enrich
+        # Reuse the single-file understanding logic for media rows. With enrich=False
+        # that is just "hand the file to the embedder".
+        self._indexer = Indexer(cfg, captioner, transcriber, embedder, store, enrich=enrich)  # type: ignore[arg-type]
 
     def _understand_row(self, row: dict) -> Optional[MediaDocument]:
         media_type = row["media_type"]

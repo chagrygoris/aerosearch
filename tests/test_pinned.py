@@ -27,7 +27,7 @@ def test_fingerprint_is_stable_and_short():
         ("PASSAGE_PREFIX", "doc: "),
         ("QUERY_PREFIX", "q: "),
         ("FUSION_VERSION", "fuse-v2"),
-        ("IMAGE_MODE", "none"),
+        ("MEDIA_MODE", "none"),
     ],
 )
 def test_every_pinned_value_moves_the_fingerprint(monkeypatch, attr, value):
@@ -52,18 +52,18 @@ def test_config_defaults_come_from_the_pin():
 
 
 def test_active_contract_is_the_multimodal_one():
-    """Option A: images share the text space, so a photo needs no caption."""
+    """One model for every modality: no captioner, no ASR in the retrieval path."""
     assert pinned.EMBED_BACKEND == "gemma2"
     assert pinned.EMBED_DIM == 768
-    assert pinned.EMBEDS_IMAGES is True
-    assert pinned.IMAGE_MODE == "interleaved-v1"
+    assert pinned.EMBEDS_MEDIA is True
+    assert pinned.MEDIA_MODE == "av-direct-v1"
 
 
 def test_e5_fallback_contract_is_still_available_and_a_different_space():
     """The documented rollback if Russian regresses -- and why it needs a re-embed."""
     e5 = pinned._CONTRACTS["e5"]
     assert e5["dim"] == 1024 != pinned.EMBED_DIM
-    assert e5["image_mode"] == "none"
+    assert e5["media_mode"] == "none"
     assert len(e5["revision"]) == 40
 
 

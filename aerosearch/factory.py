@@ -62,10 +62,20 @@ def build_captioner(cfg: Config, backend: str = "real") -> Captioner:
 
 
 def build_transcriber(cfg: Config, backend: str = "real") -> Transcriber:
+    """Whisper, or nothing.
+
+    Not part of the baseline: EmbeddingGemma 2 embeds speech audio directly, so a
+    transcript is only needed when you want the words as readable text. Whisper is
+    kept for that and for comparison (`--enrich`).
+    """
     if backend == "fake":
         from .understanding.fakes import FakeTranscriber
 
         return FakeTranscriber()
+    if backend == "none":
+        from .understanding.null import NullTranscriber
+
+        return NullTranscriber()
     from .understanding.transcribe_whisper import WhisperTranscriber
 
     return WhisperTranscriber(cfg.model.transcribe_model)
