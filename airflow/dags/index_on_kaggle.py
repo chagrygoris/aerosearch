@@ -308,7 +308,8 @@ with DAG(
     description="Embed pending chat media on a Kaggle T4, over a tunnel to this machine",
     default_args={"owner": "aerosearch", "retries": 0,
                   "retry_delay": timedelta(minutes=5)},
-    schedule=os.getenv("AEROSEARCH_SCHEDULE", "*/15 * * * *"),
+    # Empty AEROSEARCH_SCHEDULE means manual-only (trigger from the UI).
+    schedule=os.getenv("AEROSEARCH_SCHEDULE", "*/15 * * * *") or None,
     start_date=datetime(2026, 1, 1),
     catchup=False,
     max_active_runs=1,  # one GPU session at a time

@@ -51,6 +51,41 @@ x-app: &app
   restart: unless-stopped
   networks: [app-network]
 
+x-airflow-env: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-aerosearch}
+    # Must be set and stable. This default is a published dev value, which is
+    # harmless here because nothing stores Airflow Connections or Variables --
+    # all config arrives as env. Set AIRFLOW_FERNET_KEY in .env if that changes.
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-Zp0mn8Hh3nJ1kLqRtVwXyZaBcDeFgHiJkLmNoPqRsTu=}
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.session
+    AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    # New DAGs are paused by default, which would make the ▶ button queue a run
+    # that never starts. Active on arrival instead, so manual triggers just work.
+    # Consequence: with no tunnel configured the */15 schedule fails its first
+    # task every run -- the log says exactly what to set. Set AEROSEARCH_SCHEDULE=
+    # (empty) to go manual-only until your tunnel is permanent.
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-aerosearch}
+    MINIO_ENDPOINT: minio:8000
+    MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+    MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    MINIO_BUCKET: ${MINIO_BUCKET:-media}
+    # Where the Kaggle notebook reaches this machine. Without these the DAG
+    # fails its first task with instructions instead of burning a GPU session.
+    AEROSEARCH_TUNNEL_PG: ${AEROSEARCH_TUNNEL_PG:-}
+    AEROSEARCH_TUNNEL_S3: ${AEROSEARCH_TUNNEL_S3:-}
+    AEROSEARCH_KAGGLE_ACCOUNT: ${AEROSEARCH_KAGGLE_ACCOUNT:-}
+    AEROSEARCH_KAGGLE_ACCELERATOR: ${AEROSEARCH_KAGGLE_ACCELERATOR:-t4}
+    AEROSEARCH_BATCH_LIMIT: ${AEROSEARCH_BATCH_LIMIT:-200}
+    AEROSEARCH_SCHEDULE: ${AEROSEARCH_SCHEDULE:-*/15 * * * *}
+    POSTGRES_USER: ${POSTGRES_USER:-postgres}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    POSTGRES_DB: ${POSTGRES_DB:-aerosearch}
+    KAGGLE_TOKENS_DIR: /opt/pool_tokens
+    PYTHONPATH: /opt/aerosearch
+
 services:
   # ---------------------------------------------------------------- storage ---
   # S3-compatible object storage for the media itself.
@@ -134,34 +169,38 @@ services:
   # The scheduler, and the UI you trigger indexing from (http://localhost:8080).
   # Its DAG does no embedding itself: it pushes a notebook to the Kaggle pool and
   # that T4 reaches back through your tunnel. See airflow/dags/index_on_kaggle.py.
+  # Migrates Airflow's metadata tables and creates the admin user. Without this
+  # the webserver has no schema to talk to and :8080 never answers -- and no user
+  # exists to log in with. Runs to completion before the other two start, and is
+  # safe to re-run: `db migrate` is idempotent and the user creation is allowed
+  # to fail when the account already exists.
+  airflow-init:
+    build: {context: ., dockerfile: airflow.Dockerfile}
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      <<: *airflow-env
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow users create --username admin --firstname Admin --lastname User \
+          --role Admin --email admin@example.com \
+          --password "${AIRFLOW_ADMIN_PASSWORD:-admin}" || true
+        echo "airflow ready: log in as admin / ${AIRFLOW_ADMIN_PASSWORD:-admin}"
+    restart: "no"
+    networks: [app-network]
+
   airflow-webserver:
     build: {context: ., dockerfile: airflow.Dockerfile}
     depends_on:
       postgres: {condition: service_healthy}
       minio: {condition: service_healthy}
-    environment: &airflow-env
-      AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-aerosearch}
-      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
-      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-aerosearch}
-      MINIO_ENDPOINT: minio:8000
-      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
-      MINIO_BUCKET: ${MINIO_BUCKET:-media}
-      # Where the Kaggle notebook reaches this machine. Without these the DAG
-      # fails its first task with instructions instead of burning a GPU session.
-      AEROSEARCH_TUNNEL_PG: ${AEROSEARCH_TUNNEL_PG:-}
-      AEROSEARCH_TUNNEL_S3: ${AEROSEARCH_TUNNEL_S3:-}
-      AEROSEARCH_KAGGLE_ACCOUNT: ${AEROSEARCH_KAGGLE_ACCOUNT:-}
-      AEROSEARCH_KAGGLE_ACCELERATOR: ${AEROSEARCH_KAGGLE_ACCELERATOR:-t4}
-      AEROSEARCH_BATCH_LIMIT: ${AEROSEARCH_BATCH_LIMIT:-200}
-      AEROSEARCH_SCHEDULE: ${AEROSEARCH_SCHEDULE:-*/15 * * * *}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-aerosearch}
-      KAGGLE_TOKENS_DIR: /opt/pool_tokens
-      PYTHONPATH: /opt/aerosearch
+      airflow-init: {condition: service_completed_successfully}
+    environment:
+      <<: *airflow-env
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - airflow-logs:/opt/airflow/logs
@@ -181,6 +220,7 @@ services:
     build: {context: ., dockerfile: airflow.Dockerfile}
     depends_on:
       postgres: {condition: service_healthy}
+      airflow-init: {condition: service_completed_successfully}
     environment:
       <<: *airflow-env
     volumes:

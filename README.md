@@ -131,8 +131,16 @@ Put both in `.env` and restart Airflow. With Tailscale, use the tailnet IP and t
 normal ports. Pool credentials come from `KAGGLE_TOKENS_DIR` (default
 `~/pool_tokens`), mounted read-only into the Airflow containers.
 
-Then in the Airflow UI, enable `index_on_kaggle` and press ▶ to trigger a run; the
-unindexed count in Telegram (`/stats`) and on the upload page drops when it lands.
+Then in the Airflow UI press ▶ on `index_on_kaggle`; the unindexed count in
+Telegram (`/stats`) and on the upload page drops when it lands. The DAG arrives
+**active**, not paused, so the button works immediately — and so the `*/15`
+schedule starts firing. Without a tunnel each run fails its first task with the
+commands above in the log; set `AEROSEARCH_SCHEDULE=` (empty) in `.env` for
+manual-only until your tunnel is permanent.
+
+The webserver takes **~50 s** to answer on first boot: it waits for
+`airflow-init` to migrate the metadata tables and create the `admin` user
+(password from `AIRFLOW_ADMIN_PASSWORD`, default `admin`).
 
 > **One honest caveat on credentials.** The generated notebook is pushed *private*,
 > but it carries the Postgres password and S3 keys in its source, because Kaggle has
