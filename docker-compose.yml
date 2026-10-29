@@ -1,27 +1,39 @@
 version: '3.8'
 services:
+  # S3-compatible object storage. Was minio/minio, which MinIO DELETED from Docker
+  # Hub on 2026-09-11 (Hub's own API returns "object not found" for every tag, and
+  # quay.io refuses anonymous pulls), so that compose file could no longer start.
+  # Zenko CloudServer is the replacement: verified drop-in for the `minio` Python
+  # SDK the bot uses (bucket_exists / make_bucket / put_object / get_object /
+  # list_objects all behave). Keeps the MINIO_* env names so .env and the client
+  # code are untouched.
   minio:
-    image: minio/minio:latest
+    image: zenko/cloudserver:latest
     ports:
-      - "9000:9000"  # MinIO API
-      - "9001:9001"  # MinIO Console
+      - "9000:8000"  # S3 API (CloudServer listens on 8000 internally)
     environment:
-      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
-      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      # CloudServer's own names for the static credentials.
+      - SCALITY_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+      - SCALITY_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - S3BACKEND=file          # durable on disk; "mem" loses everything on restart
+      - REMOTE_MANAGEMENT_DISABLE=1
+      - ENDPOINT=minio
     volumes:
-      - ./minio-data:/data
-    command: server /data --console-address ":9001"
+      - ./minio-data:/usr/src/app/localData
+      - ./minio-metadata:/usr/src/app/localMetadata
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      # Unauthenticated ListBuckets answers 403, which proves S3 is serving.
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/ | grep -qE '403|200'"]
       interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
     networks:
       - app-network
 
   postgres:
-    # image: postgres:15
-    image: ankane/pgvector:latest
+    # Was ankane/pgvector, which Docker Hub now reports as archived (unmaintained).
+    # pgvector/pgvector is the project's own image and is active.
+    image: pgvector/pgvector:pg17
     environment:
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}

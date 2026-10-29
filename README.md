@@ -175,13 +175,26 @@ index immediately.
 | What | Where | Notes |
 |---|---|---|
 | **Bot logs** | terminal (Path A) or `docker compose logs -f bot` | shows "queued photo/video/text" per ingest |
-| **Media files** | MinIO console → http://localhost:9001 | log in with `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD`, open the `media` bucket |
+| **Media files** | `./minio-data/` on disk, or any S3 client against `localhost:9000` | CloudServer has no web console; the objects are plain files under `minio-data/` |
 | **Saved messages/rows** | Postgres `media` table | `docker compose exec postgres psql -U postgres -d aerosearch -c "select media_id, media_type, user_name, left(document,60), (embedding is not null) as indexed from media order by media_id desc limit 20;"` |
 | **Airflow UI + task logs** | http://localhost:8080 | log in `admin` / `AIRFLOW_ADMIN_PASSWORD`; DAG `index_pending_media`; click a run → task → Logs |
 | **Airflow log files** | `airflow/logs/` on disk | mounted from the scheduler/worker |
 
 Stop everything: `docker compose down` (add `-v` to also wipe MinIO/Postgres data).
 
+> **Object storage note:** the `minio` service runs **`zenko/cloudserver`**, not
+> `minio/minio` — MinIO deleted those images from Docker Hub on 2026-09-11 (Hub's own
+> API returns "object not found" for every tag; quay.io refuses anonymous pulls), so
+> the old compose file could not start at all. CloudServer is a verified drop-in for
+> the `minio` Python SDK the bot uses, and the `MINIO_*` variables in `.env` are
+> unchanged. It exposes the S3 API on `localhost:9000` and has **no web console**.
+>
+> **Postgres note:** the image is **`pgvector/pgvector:pg17`** (the project's own,
+> active) rather than `ankane/pgvector`, which Docker Hub reports as *archived*. That
+> moves Postgres 15 → 17, and **data directories are not compatible across major
+> versions**, so an existing `postgres-data/` must be wiped: `docker compose down -v`.
+> The embedding contract change forces a re-embed anyway, so nothing extra is lost.
+>
 > **Schema note:** the embedding column width follows the pinned contract —
 > legacy was `vector(1536)`, e5-large was **1024**, EmbeddingGemma 2 is **768**.
 > `init()` now checks the existing column and refuses with a clear message rather

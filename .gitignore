@@ -21,3 +21,4 @@ kaggle*.json
 *_tokens/
 *_tokens_*/
 pool_tokens/
+minio-metadata/
