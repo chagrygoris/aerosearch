@@ -1,5 +1,7 @@
-# One image for both the bot and the indexing worker: they share the same
-# EmbeddingGemma 2 embedder, so building twice would download torch twice.
+# Image for both the bot and the indexing worker -- they load the same
+# EmbeddingGemma 2 embedder, so one definition serves both. compose builds it
+# once per service under its own tag; the second is a full cache hit and the
+# layers are stored once, so nothing is downloaded or kept twice.
 #
 # Models are NOT baked in. EmbeddingGemma 2 is ~1.5 GB and would make this image
 # enormous and stale; instead HF_HOME points at a named volume so the download

@@ -22,9 +22,12 @@
 # and the worker both load EmbeddingGemma 2, so building twice would download
 # torch twice.
 x-app: &app
-  # One shared image name, so `bot` and `worker` build and store it once rather
-  # than twice -- it carries torch, so that matters.
-  image: aerosearch-app:local
+  # No shared `image:` tag here. Both services build from this same Dockerfile and
+  # context, and giving them one tag makes compose build them in PARALLEL into the
+  # same name, which fails with: image "aerosearch-app:local": already exists.
+  # Per-service default tags (aerosearch-worker / aerosearch-bot) avoid the race,
+  # and cost nothing: identical Dockerfile + context means the second build is a
+  # full cache hit, and the layers are content-addressed so they are stored once.
   build:
     context: .
     dockerfile: Dockerfile
