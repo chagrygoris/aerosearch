@@ -67,20 +67,31 @@ class EmbeddingGemma2Embedder:
         device: str | None = None,
         revision: str | None = EMBED_REVISION,
         max_images: int = DEFAULT_MAX_IMAGES,
+        text_only: bool = False,
     ):
+        """`text_only` loads just the text tower (~270M of 740M).
+
+        That is all the *query* side needs: a search box only ever embeds text, and
+        queries and media land in the same space either way. The retrieval server
+        uses it so the local footprint stays small, while media embedding -- which
+        does need vision and audio -- happens on a T4.
+        """
         self.model_name = model_name
         self._device = device
         self._revision = revision
         self.max_images = max_images
+        self.text_only = text_only
         self.dim = EMBED_DIM  # confirmed against the loaded model below
 
     @cached_property
     def _model(self):
         from sentence_transformers import SentenceTransformer
 
-        # The full 740M model: text + vision + audio. Every encoder is used, since
-        # speech is embedded directly rather than transcribed first.
+        # Full model (740M) embeds text + vision + audio, which media needs. The
+        # query side sets text_only and skips both media encoders.
         kwargs: dict[str, Any] = {"device": self._device}
+        if self.text_only:
+            kwargs["config_kwargs"] = {"audio_config": None, "vision_config": None}
         if self._revision:
             kwargs["revision"] = self._revision
         model = SentenceTransformer(self.model_name, **kwargs)
@@ -124,6 +135,14 @@ class EmbeddingGemma2Embedder:
     # --- media --------------------------------------------------------------
 
     def embed_file(self, path: str, media_type: str, text: str = "") -> list[float]:
+        if self.text_only:
+            raise RuntimeError(
+                "this embedder was loaded text_only (query side); media embedding "
+                "needs the vision/audio encoders and runs on the GPU pool"
+            )
+        return self._embed_file(path, media_type, text)
+
+    def _embed_file(self, path: str, media_type: str, text: str = "") -> list[float]:
         """Embed a media file directly — the baseline path for photos and video.
 
         `media_type` is "photo" or "video"; anything else is treated as text. The

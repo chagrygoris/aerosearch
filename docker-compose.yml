@@ -106,12 +106,15 @@ services:
     networks: [app-network]
 
   # ------------------------------------------------------------ aerosearch ---
-  # Indexes rows the bot leaves pending. Replaces the Airflow DAG for normal use.
-  worker:
+  # Retrieval server: query embedder (text-only), /search, /stats, upload site.
+  # The only local process that holds a model, and it never embeds media.
+  server:
     <<: *app
     environment:
       <<: *app-env
-    command: ["aerosearch", "worker", "--interval", "${AEROSEARCH_POLL_SECONDS:-30}"]
+    command: ["uvicorn", "aerosearch.server:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${AEROSEARCH_PORT:-8000}:8000"
 
   # Telegram frontend: ingest + /search + /stats.
   bot:
@@ -119,19 +122,19 @@ services:
     environment:
       <<: *app-env
       API_KEY: ${API_KEY:?Set your Telegram bot token, e.g. echo 'API_KEY=123456:token-from-BotFather' > .env}
+      AEROSEARCH_SERVER: http://server:8000
     working_dir: /app/bot
     command: ["python", "bot.py"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      server: {condition: service_started}
 
   # --------------------------------------------------------------- airflow ---
-  # Optional. The worker above does the same indexing on a poll loop, so Airflow
-  # is only worth starting for its UI and scheduling:
-  #
-  #   docker compose --profile airflow up -d
-  #
-  # It needs AIRFLOW_FERNET_KEY set to a real key; generate one with
-  #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+  # The scheduler, and the UI you trigger indexing from (http://localhost:8080).
+  # Its DAG does no embedding itself: it pushes a notebook to the Kaggle pool and
+  # that T4 reaches back through your tunnel. See airflow/dags/index_on_kaggle.py.
   airflow-webserver:
-    profiles: [airflow]
     build: {context: ., dockerfile: airflow.Dockerfile}
     depends_on:
       postgres: {condition: service_healthy}
@@ -146,10 +149,28 @@ services:
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
       MINIO_BUCKET: ${MINIO_BUCKET:-media}
+      # Where the Kaggle notebook reaches this machine. Without these the DAG
+      # fails its first task with instructions instead of burning a GPU session.
+      AEROSEARCH_TUNNEL_PG: ${AEROSEARCH_TUNNEL_PG:-}
+      AEROSEARCH_TUNNEL_S3: ${AEROSEARCH_TUNNEL_S3:-}
+      AEROSEARCH_KAGGLE_ACCOUNT: ${AEROSEARCH_KAGGLE_ACCOUNT:-}
+      AEROSEARCH_KAGGLE_ACCELERATOR: ${AEROSEARCH_KAGGLE_ACCELERATOR:-t4}
+      AEROSEARCH_BATCH_LIMIT: ${AEROSEARCH_BATCH_LIMIT:-200}
+      AEROSEARCH_SCHEDULE: ${AEROSEARCH_SCHEDULE:-*/15 * * * *}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-aerosearch}
+      KAGGLE_TOKENS_DIR: /opt/pool_tokens
+      PYTHONPATH: /opt/aerosearch
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - airflow-logs:/opt/airflow/logs
       - hf-cache:/models
+      # gpu_pool + the aerosearch package, imported by the DAG.
+      - ./gpu_pool:/opt/aerosearch/gpu_pool:ro
+      - ./aerosearch:/opt/aerosearch/aerosearch:ro
+      # Kaggle pool credentials. Read-only, and never baked into an image.
+      - ${KAGGLE_TOKENS_DIR:-~/pool_tokens}:/opt/pool_tokens:ro
     ports:
       - "${AIRFLOW_PORT:-8080}:8080"
     command: webserver
@@ -157,7 +178,6 @@ services:
     networks: [app-network]
 
   airflow-scheduler:
-    profiles: [airflow]
     build: {context: ., dockerfile: airflow.Dockerfile}
     depends_on:
       postgres: {condition: service_healthy}
@@ -167,6 +187,9 @@ services:
       - ./airflow/dags:/opt/airflow/dags
       - airflow-logs:/opt/airflow/logs
       - hf-cache:/models
+      - ./gpu_pool:/opt/aerosearch/gpu_pool:ro
+      - ./aerosearch:/opt/aerosearch/aerosearch:ro
+      - ${KAGGLE_TOKENS_DIR:-~/pool_tokens}:/opt/pool_tokens:ro
     command: scheduler
     restart: unless-stopped
     networks: [app-network]

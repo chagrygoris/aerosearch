@@ -19,53 +19,56 @@ stage disappears. Measured end to end on CPU with no captioner and no ASR: 4/4 o
 mixed set — a spoken clip found from "speech about the government", an image found
 from the Russian text rendered inside it.
 
-## Pipeline
+## Architecture
+
+Nothing heavy runs on your machine. The only local model is the **text-only**
+query encoder (~270M of EmbeddingGemma 2's 740M) — a search box never embeds
+pixels. Media embedding, which does need the vision and audio encoders, happens
+on a Kaggle **T4**.
 
 ```
-media file (photo / video+audio) ──▶ EmbeddingGemma 2 ──▶ 768-d vector ──▶ pgvector
-                                             ▲                                  │
-query text ──────────────────────────────────┘────────────────────── cosine ─────┘
+YOUR MACHINE (docker compose)                      KAGGLE (T4, gpu_pool)
+─────────────────────────────                      ─────────────────────
+  bot          Telegram ingest, /search, /stats
+   │                      │
+   ▼                      ▼
+  server       query embedder (text-only) ─▶ pgvector cosine
+   │           upload site for chat exports
+   ▼
+  postgres + minio  ◀───────── tunnel ──────────▶  embeds media on GPU,
+   ▲                                               writes vectors back
+   │
+  airflow      schedules + manual trigger ──push notebook──▶
 ```
 
-One model, every modality. A media file is handed to the embedder as it is — no
-frame sampling, no captioning, no ASR, no ffmpeg in the retrieval path. A captioner
-(Gemma) and a transcriber (Whisper) remain available behind `--enrich` for when you
-want the words as *readable text*, but they are an experiment to justify by
-measurement rather than part of the default path.
+Media never lands on Kaggle's storage: the notebook streams it over your tunnel
+and keeps it on the kernel's ephemeral disk.
 
-## Deployment (no always-on GPU)
+| Service | Role | Port |
+|---|---|---|
+| `bot` | Telegram ingest, `/search`, `/stats`. Holds **no** model. | — |
+| `server` | query embedder, `/search` API, upload site, `/stats` | 8000 |
+| `postgres` | rows + vectors (pgvector) | 5432 |
+| `minio` | media (CloudServer, S3 API) | 9000 |
+| `airflow-webserver` | UI: schedule + **manual trigger** | 8080 |
+| `airflow-scheduler` | runs `index_on_kaggle` every 15 min | — |
 
-The bot is thin; understanding runs on a **CPU batch schedule**:
+### The indexing run
+
+[`airflow/dags/index_on_kaggle.py`](airflow/dags/index_on_kaggle.py):
 
 ```
-Telegram ─▶ bot ─▶ MinIO (media) + Postgres row w/ NULL embedding  (ingest, cheap)
-                                    │
-              Airflow every 15m ─▶ BatchIndexer: Whisper + EmbeddingGemma 2 (CPU)
-                                    │            ─▶ writes embedding back
-Telegram ◀─ bot ◀─ /search ◀─ eg2 query embed ◀─ pgvector cosine search  (query-side only)
+tunnel_reachable → count_pending → launch_on_pool → wait_for_kernel → verify
 ```
 
-- **Ingest** (`bot/bot.py`): captures photos, videos **and text messages**, uploads
-  media to MinIO, inserts a *pending* row via `store.add_pending`.
-- **Batch worker** (`aerosearch/batch.py`, DAG `airflow/dags/index_pending.py`):
-  picks up NULL-embedding rows, understands + embeds them (Gemma 3n E2B on CPU),
-  writes vectors back. Runs every 15 min.
-- **Search** (`/search <query>`): the only model the bot loads is EmbeddingGemma 2,
-  to embed the query.
-
-Captioner is chosen by model name: `AEROSEARCH_CAPTION_MODEL=google/gemma-3n-E2B-it`
-(CPU batch) or `google/gemma-3-4b-it` (T4 4-bit). Gemma 3n also hears audio, so
-`Gemma3nCaptioner.caption_av` enables a single-model A/B vs Whisper+Gemma3.
-
-- **Extraction** (`aerosearch/media`): ffmpeg samples N frames/clip + pulls mono
-  16k audio. No moviepy.
-- **Understanding** (`aerosearch/understanding`): pluggable `Captioner` /
-  `Transcriber` / `Embedder` protocols with `fake` (offline), CPU, and CUDA/4-bit
-  backends chosen by `factory.py`.
-- **Fusion** (`aerosearch/fusion.py`): caption + transcript + filename hint → one
-  embeddable document.
-- **Store** (`aerosearch/store`): in-memory numpy store (dev/tests, persists to
-  `.npz`+`.json`) and async pgvector store (prod, reuses the bot's Postgres).
+- **`tunnel_reachable`** fails first and loudly if the tunnel is down, rather than
+  spending a GPU session to discover it.
+- **`count_pending`** *skips the run* when nothing is pending, so a 15-minute
+  schedule costs no quota on an idle chat.
+- **`launch_on_pool`** generates a notebook with your tunnel endpoints baked in and
+  pushes it to whichever pool account has spare T4 quota (`gpu_pool/`).
+- **`verify`** checks the pending count actually dropped — a kernel can finish
+  "complete" having embedded nothing.
 
 ## Quickstart (offline, no GPU, no models)
 
@@ -95,80 +98,58 @@ Gemma 3 is gated on Hugging Face — set `HF_TOKEN` before downloading.
 
 ## Running it
 
-One command, on any machine with Docker. The only thing nobody can default for
-you is your Telegram bot token from [@BotFather](https://t.me/botfather):
-
 ```bash
 echo 'API_KEY=123456:your-token-from-BotFather' > .env
 docker compose up -d
 ```
 
-That starts four services — `postgres`, `minio` (object storage), `worker` and
-`bot` — and nothing else needs configuring: every other value has a working
-default in `docker-compose.yml`, so **no `.env` beyond the token is required**.
-First start downloads EmbeddingGemma 2 (~1.5 GB) into a named volume, so it
-happens once rather than per restart.
+Six services, every other value defaulted. Then:
+
+| What | Where |
+|---|---|
+| Upload a chat export, see counts | <http://localhost:8000> |
+| Airflow UI — trigger indexing | <http://localhost:8080> |
+| Telegram | DM the bot: `/search`, `/stats` |
+
+### Bulk-importing chat history
+
+In Telegram Desktop: **⋮ → Export chat history**, format **JSON**. Upload the
+resulting ZIP at <http://localhost:8000>. Every message becomes a pending row —
+text inline, media pushed to storage — in the same shape the live bot inserts, so
+one indexing run picks up both. A bare `result.json` works too, text only.
+
+### Indexing needs a tunnel
+
+The Kaggle notebook has to reach *this* machine, and it cannot reach `localhost`:
 
 ```bash
-docker compose logs -f bot worker     # follow both
-docker compose down                   # stop; add -v to wipe data too
+ngrok tcp 5432        # -> AEROSEARCH_TUNNEL_PG=0.tcp.ngrok.io:17284
+ngrok tcp 9000        # -> AEROSEARCH_TUNNEL_S3=0.tcp.ngrok.io:19112
 ```
 
-Then DM the bot a photo, video or message and `/search` for it. `/stats` shows
-how much is indexed versus still queued — ingest and indexing are separate
-processes, so a just-sent clip becomes searchable on the worker's next poll
-(30 s by default, `AEROSEARCH_POLL_SECONDS`).
+Put both in `.env` and restart Airflow. With Tailscale, use the tailnet IP and the
+normal ports. Pool credentials come from `KAGGLE_TOKENS_DIR` (default
+`~/pool_tokens`), mounted read-only into the Airflow containers.
 
-> **In a group chat, Telegram delivers nothing to the bot by default.** Privacy
-> mode means it only sees slash commands and replies to itself. Either DM it, or
-> run `/setprivacy` → *Disable* in @BotFather and re-add it to the group.
+Then in the Airflow UI, enable `index_on_kaggle` and press ▶ to trigger a run; the
+unindexed count in Telegram (`/stats`) and on the upload page drops when it lands.
 
-### What runs where
+> **One honest caveat on credentials.** The generated notebook is pushed *private*,
+> but it carries the Postgres password and S3 keys in its source, because Kaggle has
+> no secrets API to provision (see [`gpu_pool/README.md`](gpu_pool/README.md)). For a
+> personal project that is a fair trade. If it stops being one: give the tunnel a
+> restricted Postgres role, and rotate the tunnel URL between runs rather than
+> treating the notebook as a secret.
 
-| Service | Image | Notes |
-|---|---|---|
-| `postgres` | `pgvector/pgvector:pg17` | vectors + rows; volume `pgdata-pg17` |
-| `minio` | `zenko/cloudserver` | S3 API on `localhost:9000`, no web console |
-| `worker` | built from `Dockerfile` | indexes pending rows on a poll loop |
-| `bot` | same image | ingest, `/search`, `/stats` |
-
-`worker` and `bot` share one image (`aerosearch-app:local`) because both load the
-same embedder — building separately would download torch twice.
-
-**Airflow is not started.** The `worker` poll loop does the same indexing without
-a scheduler, a metadata DB or a Fernet key. If you want its UI anyway:
-
-```bash
-docker compose --profile airflow up -d     # needs AIRFLOW_FERNET_KEY set
-```
-
-### Two infrastructure notes
-
-- **Postgres volumes carry their major version** (`pgdata-pg17`). A data directory
-  cannot be read by a different major Postgres, so pinning the version into the
-  volume name means a future bump creates a fresh volume instead of crashing with
-  *"database files are incompatible with server"*. Nothing to remember.
-- **The torch stack comes entirely from PyPI, in one `pip install`.** Splitting it
-  across indexes (a `+cpu` torch from download.pytorch.org, torchvision from PyPI)
-  produces wheels that import and then fail with *"operator torchvision::nms does
-  not exist"*, which surfaces far away as transformers failing to import
-  `PreTrainedModel`. The CPU index is not an option because it does not carry
-  `torchcodec`. On arm64, including Apple Silicon, the PyPI wheels are CPU-only
-  anyway; on amd64 this costs ~2 GB of unused CUDA libraries.
-
-### Running the bot outside Docker
+### Running pieces outside Docker
 
 ```bash
 uv venv --python 3.12 .venv
 uv pip install --python .venv -e ".[app]"
-docker compose up -d postgres minio        # infra only
-export API_KEY=123456:your-token
-cd bot && ../.venv/bin/python bot.py       # terminal 2
-.venv/bin/aerosearch worker                # terminal 3
+docker compose up -d postgres minio
+.venv/bin/uvicorn aerosearch.server:app --port 8000     # retrieval + site
+cd bot && API_KEY=... AEROSEARCH_SERVER=http://localhost:8000 ../.venv/bin/python bot.py
 ```
-
-`config.py` is host/container aware: containers use `DATABASE_URL` and reach S3 at
-`minio:8000`, while host runs switch to `LOCAL_DATABASE_URL` and `localhost:9000`.
 
 ## Accelerator pool
 

@@ -16,6 +16,8 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from dotenv import load_dotenv
 
+import httpx
+
 from aerosearch.config import load_config
 from aerosearch.store import get_pgvector_store
 from aerosearch.types import MediaDocument
@@ -42,17 +44,33 @@ dp = Dispatcher()
 cfg = load_config()
 store = get_pgvector_store(cfg.store.database_url, table=cfg.store.table, dim=cfg.model.embed_dim)
 
-# e5 query embedder is loaded lazily on the first /search so bot startup stays fast.
-_embedder = None
+# The bot holds NO model. Query embedding and search live in the retrieval
+# server, so this process stays small and starts instantly; the server owns the
+# text-only embedder, and media embedding happens on the GPU pool.
+SERVER = os.getenv("AEROSEARCH_SERVER", "http://server:8000").rstrip("/")
 
 
-def get_embedder():
-    global _embedder
-    if _embedder is None:
-        from aerosearch.understanding.embed_e5 import E5Embedder
+async def _server_get(path: str, **params):
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(f"{SERVER}{path}", params=params)
+        r.raise_for_status()
+        return r.json()
 
-        _embedder = E5Embedder(cfg.model.embed_model)
-    return _embedder
+
+async def _server_post(path: str, **data):
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(f"{SERVER}{path}", data=data)
+        r.raise_for_status()
+        return r.json()
+
+
+async def _pending_count(chat_id: int) -> int:
+    """Unindexed messages still waiting on the scheduled GPU run."""
+    try:
+        return int((await _server_get("/stats", chat_id=chat_id)).get("pending", 0))
+    except Exception:
+        logger.warning("could not read /stats from %s", SERVER, exc_info=True)
+        return -1
 
 
 def _display_name(user: types.User) -> str:
@@ -64,30 +82,33 @@ async def handle_start(message: types.Message) -> None:
     await message.answer(
         "👋 I index this chat's photos, videos and messages for semantic search.\n\n"
         "/search <what you remember> — find media by meaning\n"
-        "/stats — how much is indexed vs still being processed"
+        "/stats — how much is indexed vs still unindexed\n\n"
+        "Bulk-import a chat export at the upload page; indexing runs on the GPU "
+        "pool, scheduled by Airflow."
     )
 
 
 @dp.message(Command("stats"))
 async def handle_stats(message: types.Message) -> None:
-    """What's indexed vs still waiting on the worker.
+    """Indexed vs still-unindexed counts for this chat."""
+    try:
+        c = await _server_get("/stats", chat_id=message.chat.id)
+    except Exception:
+        await message.answer("Can't reach the retrieval server right now.")
+        return
 
-    Ingest and indexing are separate processes, so a just-sent clip is searchable
-    only after the worker picks it up. This makes that visible instead of looking
-    like /search is broken.
-    """
-    c = await store.counts(chat_id=message.chat.id)
-    if not c["indexed"] and not c["pending"]:
+    if not c.get("indexed") and not c.get("pending"):
         await message.answer("Nothing from this chat yet. Send a photo, video or message.")
         return
 
-    lines = [f"📊 <b>{c['indexed']}</b> searchable, <b>{c['pending']}</b> waiting to be indexed."]
+    lines = [f"📊 <b>{c.get('indexed', 0)}</b> searchable, "
+             f"<b>{c.get('pending', 0)}</b> not indexed yet."]
     for kind in ("photo", "video", "text"):
         got, wait = c.get(f"{kind}_indexed", 0), c.get(f"{kind}_pending", 0)
         if got or wait:
             lines.append(f"  {kind}: {got} indexed, {wait} pending")
-    if c["pending"]:
-        lines.append("\nRun <code>aerosearch worker</code> to index the pending ones.")
+    if c.get("pending"):
+        lines.append("\nIndexing runs on the GPU pool — trigger it from the Airflow UI.")
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
@@ -99,20 +120,29 @@ async def handle_search(message: types.Message) -> None:
         return
     query = query[1]
 
-    embedder = get_embedder()
-    qv = await asyncio.to_thread(embedder.embed_query, query)
-    hits = await store.search(qv, k=5, chat_id=message.chat.id)
+    try:
+        result = await _server_post("/search", query=query, k=5, chat_id=message.chat.id)
+    except Exception:
+        logger.exception("search failed")
+        await message.answer("Can't reach the retrieval server right now.")
+        return
+
+    hits = result.get("hits", [])
+    pending = await _pending_count(message.chat.id)
 
     if not hits:
-        await message.answer("Nothing indexed matches that yet. (Indexing runs periodically.)")
+        note = f" {pending} item(s) are still waiting to be indexed." if pending > 0 else ""
+        await message.answer(f"Nothing indexed matches that yet.{note}")
         return
 
     lines = [f"🔎 Top matches for <b>{query}</b>:"]
     for i, h in enumerate(hits, 1):
-        snippet = (h.document or "").replace("\n", " ")[:120]
-        lines.append(f"{i}. <i>{h.media_type}</i> ({h.score:.2f}) — {snippet}")
-        if h.s3_url:
-            lines.append(f"    {h.s3_url}")
+        snippet = (h.get("document") or "").replace("\n", " ")[:120]
+        lines.append(f"{i}. <i>{h['media_type']}</i> ({h['score']:.2f}) — {snippet}")
+        if h.get("s3_url"):
+            lines.append(f"    {h['s3_url']}")
+    if pending > 0:
+        lines.append(f"\n<i>{pending} item(s) not indexed yet.</i>")
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
