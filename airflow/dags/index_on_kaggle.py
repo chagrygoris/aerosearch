@@ -55,32 +55,101 @@ KERNEL_TIMEOUT = int(os.getenv("AEROSEARCH_KAGGLE_TIMEOUT", "3600"))
 BATCH_LIMIT = int(os.getenv("AEROSEARCH_BATCH_LIMIT", "200"))
 
 
-def _tunnel_endpoints() -> tuple[str, str]:
-    pg = os.getenv("AEROSEARCH_TUNNEL_PG", "")
-    s3 = os.getenv("AEROSEARCH_TUNNEL_S3", "")
-    if not pg or not s3:
+NGROK_API = os.getenv("NGROK_API", "http://ngrok:4040/api/tunnels")
+SERVER_URL = os.getenv("AEROSEARCH_SERVER", "http://server:8000")
+TOKEN_PATH = os.getenv("AEROSEARCH_TOKEN_PATH", "/secrets/internal_token")
+
+
+def _internal_token() -> str:
+    """The shared secret the retrieval server generated on first boot."""
+    env = os.getenv("AEROSEARCH_INTERNAL_TOKEN")
+    if env:
+        return env.strip()
+    try:
+        with open(TOKEN_PATH) as fh:
+            token = fh.read().strip()
+    except FileNotFoundError as exc:
         raise AirflowFailException(
-            "AEROSEARCH_TUNNEL_PG and AEROSEARCH_TUNNEL_S3 must point at this "
-            "machine's Postgres and S3 as reachable from the internet, e.g.\n"
-            "  ngrok tcp 5432   -> AEROSEARCH_TUNNEL_PG=0.tcp.ngrok.io:17284\n"
-            "  ngrok tcp 9000   -> AEROSEARCH_TUNNEL_S3=0.tcp.ngrok.io:19112\n"
-            "Set them in .env; the Kaggle notebook cannot reach localhost."
+            f"no internal token at {TOKEN_PATH}. The retrieval server writes it on "
+            f"first boot; is the `server` service up, and does it share the "
+            f"`secrets` volume with Airflow?"
+        ) from exc
+    if not token:
+        raise AirflowFailException(f"{TOKEN_PATH} is empty")
+    return token
+
+
+def _public_url() -> str:
+    """Ask the local ngrok agent for its public URL.
+
+    Discovered, never configured: ngrok's free URLs change on restart, and having
+    to paste one into .env after every restart is exactly the friction this
+    avoids. AEROSEARCH_PUBLIC_URL overrides it for a stable domain or a different
+    tunnel entirely.
+    """
+    override = os.getenv("AEROSEARCH_PUBLIC_URL", "").strip()
+    if override:
+        return override.rstrip("/")
+
+    import json
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(NGROK_API, timeout=10) as resp:
+            data = json.load(resp)
+    except Exception as exc:
+        raise AirflowFailException(
+            f"could not reach the ngrok agent at {NGROK_API}: {exc}\n"
+            f"Start it with `docker compose up -d ngrok` (needs NGROK_AUTHTOKEN in "
+            f".env -- a free ngrok account), or set AEROSEARCH_PUBLIC_URL to your "
+            f"own https tunnel pointing at the `server` service."
+        ) from exc
+
+    for tunnel in data.get("tunnels", []):
+        url = tunnel.get("public_url", "")
+        if url.startswith("https://"):
+            return url.rstrip("/")
+    raise AirflowFailException(
+        f"the ngrok agent at {NGROK_API} has no https tunnel yet. "
+        f"Check `docker compose logs ngrok` -- an invalid NGROK_AUTHTOKEN or the "
+        f"3-endpoint free-plan cap are the usual causes."
+    )
+
+
+def tunnel_reachable(**context):
+    """Resolve the public URL and prove the GPU side can actually use it.
+
+    Fails here rather than after a GPU session has been spent discovering it.
+    """
+    import json
+    import urllib.request
+
+    url = _public_url()
+    token = _internal_token()
+    req = urllib.request.Request(
+        f"{url}/internal/pending?limit=1",
+        headers={"Authorization": f"Bearer {token}",
+                 "ngrok-skip-browser-warning": "1"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.load(resp)
+    except Exception as exc:
+        raise AirflowFailException(
+            f"{url}/internal/pending is not usable from here: {exc}\n"
+            f"The tunnel must point at the `server` service (port 8000)."
+        ) from exc
+
+    remote_fp = body.get("fingerprint")
+    from aerosearch.pinned import fingerprint as local_fp
+
+    if remote_fp != local_fp():
+        raise AirflowFailException(
+            f"contract mismatch through the tunnel: {remote_fp!r} vs {local_fp()!r}"
         )
-    return pg, s3
-
-
-def tunnel_reachable(**_):
-    """Fail fast if the tunnel is down, instead of burning a GPU session on it."""
-    for label, hostport in zip(("postgres", "s3"), _tunnel_endpoints()):
-        host, _, port = hostport.rpartition(":")
-        try:
-            with socket.create_connection((host, int(port)), timeout=10):
-                logger.info("tunnel OK: %s at %s", label, hostport)
-        except Exception as exc:
-            raise AirflowFailException(
-                f"tunnel for {label} ({hostport}) is not reachable from here: {exc}. "
-                f"Start the tunnel, then trigger the DAG again."
-            ) from exc
+    logger.info("tunnel OK: %s (contract %s)", url, remote_fp)
+    context["ti"].xcom_push(key="public_url", value=url)
+    return url
 
 
 def count_pending(**context):
@@ -109,90 +178,93 @@ def count_pending(**context):
     return pending
 
 
-def _notebook_source(pg: str, s3: str) -> str:
-    """The cell the T4 runs: pull pending rows over the tunnel, embed, write back."""
-    pg_host, _, pg_port = pg.rpartition(":")
+def _notebook_source(public_url: str, token: str) -> str:
+    """The cell the T4 runs.
+
+    It never touches Postgres or S3: it pulls work, media and pushes vectors over
+    one authenticated HTTP endpoint, so the database stays off the public internet
+    and its password stays out of this notebook. The only secret here is a bearer
+    token scoped to /internal/*.
+    """
     return f'''
 import subprocess, sys
 subprocess.run([sys.executable, "-m", "pip", "install", "-q",
                 "sentence-transformers[image]>=6.1.0", "librosa", "torchcodec",
-                "asyncpg", "minio", "pillow"], check=True)
+                "requests", "pillow"], check=True)
 
-import asyncio, os, tempfile
-import asyncpg
-from minio import Minio
+import os, tempfile, requests, torch
 from sentence_transformers import SentenceTransformer
 
-DSN = "postgresql://{os.getenv('POSTGRES_USER', 'postgres')}:{os.getenv('POSTGRES_PASSWORD', 'postgres')}@{pg_host}:{pg_port}/{os.getenv('POSTGRES_DB', 'aerosearch')}"
-S3_ENDPOINT = "{s3}"
-BUCKET = "{os.getenv('MINIO_BUCKET', 'media')}"
+BASE = "{public_url}"
+H = {{"Authorization": "Bearer {token}", "ngrok-skip-browser-warning": "1"}}
 LIMIT = {BATCH_LIMIT}
 
-# Must match aerosearch/pinned.py exactly, or the vectors land in another space.
-MODEL = "{os.getenv('AEROSEARCH_EMBED_MODEL', 'google/embeddinggemma-2')}"
-REVISION = "{os.getenv('AEROSEARCH_EMBED_REVISION', 'f9972ac22e696a105c482202646979e33e4b5a1e')}"
-DOC_PREFIX = "title: none | text: "
+print("device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU (no GPU!)")
 
-import torch
-print("device:", "cuda" if torch.cuda.is_available() else "CPU (no GPU!)",
-      torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")
-model = SentenceTransformer(MODEL, revision=REVISION,
+work = requests.get(f"{{BASE}}/internal/pending", params={{"limit": LIMIT}},
+                    headers=H, timeout=60).json()
+rows = work["rows"]
+c = work["contract"]
+print(f"{{len(rows)}} pending row(s); contract {{work['fingerprint']}}")
+
+# Load exactly what the server pins, or the vectors land in another space.
+model = SentenceTransformer(c["embed_model"], revision=c["embed_revision"],
                             device="cuda" if torch.cuda.is_available() else "cpu")
 if getattr(model, "default_prompt_name", None):
     model.default_prompt_name = None
-print("dim:", model.get_embedding_dimension() if hasattr(model, "get_embedding_dimension")
-      else model.get_sentence_embedding_dimension())
-
-s3 = Minio(S3_ENDPOINT, access_key="{os.getenv('MINIO_ACCESS_KEY', 'minioadmin')}",
-           secret_key="{os.getenv('MINIO_SECRET_KEY', 'minioadmin123')}", secure=False)
+DOC_PREFIX = c["passage_prefix"]
 
 def embed_media(path, media_type):
     if media_type == "photo":
-        payload = {{"image": path}}
-    else:
-        try:
-            v = model.encode({{"video": path, "audio": path}}, normalize_embeddings=True)
-            return v.tolist()
-        except Exception as exc:
-            print("  no decodable audio, video only:", exc)
-            payload = {{"video": path}}
-    return model.encode(payload, normalize_embeddings=True).tolist()
+        return model.encode({{"image": path}}, normalize_embeddings=True).tolist()
+    try:
+        # Both keys: video alone leaves the speech out.
+        return model.encode({{"video": path, "audio": path}},
+                            normalize_embeddings=True).tolist()
+    except Exception as exc:
+        print("   no decodable audio, video only:", exc)
+        return model.encode({{"video": path}}, normalize_embeddings=True).tolist()
 
-async def main():
-    conn = await asyncpg.connect(DSN)
-    rows = await conn.fetch(
-        "SELECT media_id, media_type, s3_url, source, document FROM media "
-        "WHERE embedding IS NULL ORDER BY media_id LIMIT $1", LIMIT)
-    print(f"{{len(rows)}} pending row(s)")
-    done = 0
-    for r in rows:
-        try:
-            if r["media_type"] == "text":
-                text = (r["document"] or "").strip()
-                if not text:
-                    continue
-                vec = model.encode(DOC_PREFIX + text, normalize_embeddings=True).tolist()
-                doc = text
-            else:
-                obj = (r["s3_url"] or "").split("/" + BUCKET + "/", 1)[-1]
-                ext = os.path.splitext(obj)[1] or (".jpg" if r["media_type"] == "photo" else ".mp4")
-                with tempfile.TemporaryDirectory() as wd:
-                    local = os.path.join(wd, "media" + ext)
-                    s3.fget_object(BUCKET, obj, local)
-                    vec = embed_media(local, r["media_type"])
-                doc = (r["source"] or "").rsplit(".", 1)[0].replace("_", " ")
-            lit = "[" + ",".join(f"{{x:.7f}}" for x in vec) + "]"
-            await conn.execute(
-                "UPDATE media SET embedding = $1::vector, document = COALESCE(document, $2) "
-                "WHERE media_id = $3", lit, doc, r["media_id"])
-            done += 1
-            print(f"  [{{done}}/{{len(rows)}}] {{r['media_id']}} {{r['media_type']}}")
-        except Exception as exc:
-            print(f"  FAILED {{r['media_id']}}: {{type(exc).__name__}}: {{exc}}")
-    await conn.close()
-    print("EMBEDDED", done)
+items, failed = [], 0
+for i, r in enumerate(rows, 1):
+    mid, mtype = r["media_id"], r["media_type"]
+    try:
+        if mtype == "text":
+            text = (r.get("document") or "").strip()
+            if not text:
+                continue
+            vec = model.encode(DOC_PREFIX + text, normalize_embeddings=True).tolist()
+            doc = text
+        else:
+            resp = requests.get(f"{{BASE}}/internal/media/{{mid}}", headers=H, timeout=300)
+            resp.raise_for_status()
+            ext = resp.headers.get("X-Aerosearch-Ext") or (
+                ".jpg" if mtype == "photo" else ".mp4")
+            with tempfile.TemporaryDirectory() as wd:
+                local = os.path.join(wd, "media" + ext)
+                with open(local, "wb") as fh:
+                    fh.write(resp.content)
+                vec = embed_media(local, mtype)
+            doc = (r.get("source") or "").rsplit(".", 1)[0].replace("_", " ")
+        items.append({{"media_id": mid, "embedding": vec, "document": doc,
+                      "media_type": mtype, "source": r.get("source") or ""}})
+        print(f"  [{{i}}/{{len(rows)}}] {{mid}} {{mtype}}")
+    except Exception as exc:
+        failed += 1
+        print(f"  FAILED {{mid}}: {{type(exc).__name__}}: {{exc}}")
 
-asyncio.run(main())
+    # Push in batches so a late crash does not throw away finished work.
+    if len(items) >= 25:
+        out = requests.post(f"{{BASE}}/internal/embeddings", headers=H, timeout=300,
+                            json={{"fingerprint": work["fingerprint"], "items": items}}).json()
+        print("   pushed:", out)
+        items = []
+
+if items:
+    out = requests.post(f"{{BASE}}/internal/embeddings", headers=H, timeout=300,
+                        json={{"fingerprint": work["fingerprint"], "items": items}}).json()
+    print("   pushed:", out)
+print("DONE failed=", failed)
 '''
 
 
@@ -204,7 +276,8 @@ def launch_on_pool(**context):
     from gpu_pool import PoolLauncher, PoolRouter
     from gpu_pool.launcher import NotebookSpec
 
-    pg, s3 = _tunnel_endpoints()
+    url = context["ti"].xcom_pull(task_ids="tunnel_reachable", key="public_url")
+    token = _internal_token()
     router = PoolRouter.from_dir(POOL_DIR)
     router.probe_all()
     launcher = PoolLauncher(router)
@@ -215,7 +288,7 @@ def launch_on_pool(**context):
             json.dump(
                 {
                     "cells": [{"cell_type": "code", "metadata": {}, "execution_count": None,
-                               "outputs": [], "source": _notebook_source(pg, s3).splitlines(True)}],
+                               "outputs": [], "source": _notebook_source(url, token).splitlines(True)}],
                     "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python",
                                                 "name": "python3"},
                                  "language_info": {"name": "python"}},

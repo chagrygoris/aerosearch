@@ -45,6 +45,9 @@ x-app: &app
     # Model cache: EmbeddingGemma 2 is downloaded once, then reused across
     # restarts and rebuilds by both services.
     - hf-cache:/models
+    # The server generates the /internal/* bearer token here on first boot;
+    # Airflow mounts the same volume read-only. Writable here on purpose.
+    - secrets:/secrets
   depends_on:
     postgres: {condition: service_healthy}
     minio: {condition: service_healthy}
@@ -74,8 +77,10 @@ x-airflow-env: &airflow-env
     MINIO_BUCKET: ${MINIO_BUCKET:-media}
     # Where the Kaggle notebook reaches this machine. Without these the DAG
     # fails its first task with instructions instead of burning a GPU session.
-    AEROSEARCH_TUNNEL_PG: ${AEROSEARCH_TUNNEL_PG:-}
-    AEROSEARCH_TUNNEL_S3: ${AEROSEARCH_TUNNEL_S3:-}
+    # Discovered from the ngrok agent; override only to use your own tunnel.
+    AEROSEARCH_PUBLIC_URL: ${AEROSEARCH_PUBLIC_URL:-}
+    NGROK_API: ${NGROK_API:-http://ngrok:4040/api/tunnels}
+    AEROSEARCH_SERVER: http://server:8000
     AEROSEARCH_KAGGLE_ACCOUNT: ${AEROSEARCH_KAGGLE_ACCOUNT:-}
     AEROSEARCH_KAGGLE_ACCELERATOR: ${AEROSEARCH_KAGGLE_ACCELERATOR:-t4}
     AEROSEARCH_BATCH_LIMIT: ${AEROSEARCH_BATCH_LIMIT:-200}
@@ -141,6 +146,24 @@ services:
     networks: [app-network]
 
   # ------------------------------------------------------------ aerosearch ---
+  # The public endpoint the Kaggle T4 reaches. ONE http tunnel to the retrieval
+  # server, not two tcp tunnels to Postgres and S3, so the database is never
+  # exposed to the internet and its password never reaches a notebook. One
+  # endpoint also leaves room under ngrok's 3-endpoint free cap.
+  #
+  # The DAG reads the public URL from this agent's local API (:4040), so a new
+  # random URL after a restart needs no action from you. Needs NGROK_AUTHTOKEN.
+  # Set AEROSEARCH_PUBLIC_URL instead to use your own tunnel and skip this.
+  ngrok:
+    image: ngrok/ngrok:latest
+    command: ["http", "server:8000", "--log=stdout"]
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+    depends_on:
+      server: {condition: service_started}
+    restart: unless-stopped
+    networks: [app-network]
+
   # Retrieval server: query embedder (text-only), /search, /stats, upload site.
   # The only local process that holds a model, and it never embeds media.
   server:
@@ -210,6 +233,7 @@ services:
       - ./aerosearch:/opt/aerosearch/aerosearch:ro
       # Kaggle pool credentials. Read-only, and never baked into an image.
       - ${KAGGLE_TOKENS_DIR:-~/pool_tokens}:/opt/pool_tokens:ro
+      - secrets:/secrets:ro
     ports:
       - "${AIRFLOW_PORT:-8080}:8080"
     command: webserver
@@ -230,6 +254,7 @@ services:
       - ./gpu_pool:/opt/aerosearch/gpu_pool:ro
       - ./aerosearch:/opt/aerosearch/aerosearch:ro
       - ${KAGGLE_TOKENS_DIR:-~/pool_tokens}:/opt/pool_tokens:ro
+      - secrets:/secrets:ro
     command: scheduler
     restart: unless-stopped
     networks: [app-network]
@@ -238,6 +263,7 @@ networks:
   app-network:
 
 volumes:
+  secrets:
   minio-data:
   minio-metadata:
   # Major version is in the name on purpose -- see the note at the top.

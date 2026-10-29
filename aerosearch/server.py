@@ -22,8 +22,8 @@ import tempfile
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from .config import load_config
 from .pinned import describe, fingerprint
@@ -32,6 +32,56 @@ from .store import get_pgvector_store
 logger = logging.getLogger(__name__)
 
 _state: dict = {}
+
+#: Where the bearer token for /internal/* is kept. Generated on first boot and
+#: shared with the Airflow container through a named volume, so nothing has to be
+#: configured by hand and no default token is ever published.
+TOKEN_PATH = os.getenv("AEROSEARCH_TOKEN_PATH", "/secrets/internal_token")
+
+
+def internal_token() -> str:
+    """The shared secret for /internal/*, created once and reused.
+
+    These endpoints are the only ones reachable through the public tunnel, and
+    they serve private chat media, so the token is generated rather than defaulted
+    -- a published default would be an open door.
+    """
+    if "token" in _state:
+        return _state["token"]
+    env = os.getenv("AEROSEARCH_INTERNAL_TOKEN")
+    if env:
+        _state["token"] = env.strip()
+        return _state["token"]
+    try:
+        with open(TOKEN_PATH) as fh:
+            token = fh.read().strip()
+        if token:
+            _state["token"] = token
+            return token
+    except FileNotFoundError:
+        pass
+    import secrets
+
+    token = secrets.token_urlsafe(32)
+    try:
+        os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
+        with open(TOKEN_PATH, "w") as fh:
+            fh.write(token)
+        os.chmod(TOKEN_PATH, 0o600)
+        logger.info("generated a new internal token at %s", TOKEN_PATH)
+    except OSError:
+        logger.warning("could not persist the internal token; it will not survive a restart")
+    _state["token"] = token
+    return token
+
+
+def require_token(authorization: str = Header(default="")) -> None:
+    """Bearer auth for the tunnel-facing endpoints."""
+    import hmac
+
+    expected = f"Bearer {internal_token()}"
+    if not hmac.compare_digest(authorization, expected):
+        raise HTTPException(status_code=401, detail="bad or missing bearer token")
 
 
 def _embedder():
@@ -130,6 +180,93 @@ async def upload(file: UploadFile = File(...), chat_id: int = Form(0)):
     finally:
         os.unlink(tmp_path)
     return result
+
+
+# --------------------------------------------------------------------------
+# /internal/* -- the only surface exposed through the tunnel.
+#
+# The GPU notebook pulls work and pushes vectors through these three endpoints.
+# Deliberately NOT a Postgres connection: this keeps the database off the public
+# internet, keeps its password out of a notebook, and needs one HTTP tunnel
+# instead of two TCP ones.
+# --------------------------------------------------------------------------
+
+
+@app.get("/internal/pending", dependencies=[Depends(require_token)])
+async def internal_pending(limit: int = 200):
+    """Rows that still need a vector. Media bytes are fetched separately."""
+    rows = await _state["store"].fetch_unindexed(limit)
+    return {
+        "fingerprint": fingerprint(),
+        "contract": describe(),
+        "rows": [
+            {"media_id": r["media_id"], "media_type": r["media_type"],
+             "source": r.get("source"), "document": r.get("document")}
+            for r in rows
+        ],
+    }
+
+
+@app.get("/internal/media/{media_id}", dependencies=[Depends(require_token)])
+async def internal_media(media_id: int):
+    """Stream one row's media straight from object storage."""
+    import asyncio
+
+    rows = await _state["store"].fetch_unindexed(10_000)
+    row = next((r for r in rows if r["media_id"] == media_id), None)
+    if row is None or not row.get("s3_url"):
+        raise HTTPException(status_code=404, detail=f"no pending media for id {media_id}")
+
+    from .store.minio_source import MinioDownloader
+
+    downloader = _state.setdefault("downloader", MinioDownloader())
+    try:
+        data = await asyncio.to_thread(downloader.download, row["s3_url"])
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"storage read failed: {exc}") from exc
+    ext = os.path.splitext(row["s3_url"])[1].lower()
+    media = "image/jpeg" if row["media_type"] == "photo" else "video/mp4"
+    return Response(content=data, media_type=media,
+                    headers={"X-Aerosearch-Ext": ext or ""})
+
+
+@app.post("/internal/embeddings", dependencies=[Depends(require_token)])
+async def internal_embeddings(payload: dict):
+    """Write vectors back.
+
+    Body: ``{"fingerprint": "...", "items": [{"media_id": 1, "embedding": [...],
+    "document": "..."}]}``. The fingerprint is checked because a mismatch means
+    the GPU side used a different contract, and those vectors would land in a
+    different space with nothing raising.
+    """
+    got = payload.get("fingerprint")
+    if got and got != fingerprint():
+        raise HTTPException(
+            status_code=409,
+            detail=f"contract mismatch: worker sent {got!r}, server pins {fingerprint()!r}. "
+                   f"Refusing to mix vector spaces.",
+        )
+    items = payload.get("items") or []
+    dim = _state["cfg"].model.embed_dim
+    written, rejected = 0, []
+    for item in items:
+        vec = item.get("embedding")
+        mid = item.get("media_id")
+        if not isinstance(vec, list) or len(vec) != dim:
+            rejected.append({"media_id": mid, "why": f"expected {dim} floats, got {len(vec) if isinstance(vec, list) else type(vec).__name__}"})
+            continue
+        from .types import MediaDocument
+
+        doc = MediaDocument(
+            source=item.get("source") or "",
+            media_type=item.get("media_type") or "video",
+            document=item.get("document") or "",
+            embedding=vec,
+        )
+        await _state["store"].update_indexed(mid, doc)
+        written += 1
+    logger.info("wrote %s vector(s) from the GPU worker, rejected %s", written, len(rejected))
+    return {"written": written, "rejected": rejected}
 
 
 PAGE = """<!doctype html>

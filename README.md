@@ -118,36 +118,38 @@ resulting ZIP at <http://localhost:8000>. Every message becomes a pending row �
 text inline, media pushed to storage — in the same shape the live bot inserts, so
 one indexing run picks up both. A bare `result.json` works too, text only.
 
-### Indexing needs a tunnel
+### Indexing needs one tunnel, set up for you
 
-The Kaggle notebook has to reach *this* machine, and it cannot reach `localhost`:
+The Kaggle notebook has to reach *this* machine, and it cannot reach `localhost`.
+Put a free [ngrok authtoken](https://dashboard.ngrok.com/get-started) in `.env`:
 
 ```bash
-ngrok tcp 5432        # -> AEROSEARCH_TUNNEL_PG=0.tcp.ngrok.io:17284
-ngrok tcp 9000        # -> AEROSEARCH_TUNNEL_S3=0.tcp.ngrok.io:19112
+echo 'NGROK_AUTHTOKEN=your-token' >> .env
+docker compose up -d
 ```
 
-Put both in `.env` and restart Airflow. With Tailscale, use the tailnet IP and the
-normal ports. Pool credentials come from `KAGGLE_TOKENS_DIR` (default
-`~/pool_tokens`), mounted read-only into the Airflow containers.
+That is all. The `ngrok` container opens **one https tunnel** to the retrieval
+server, and the DAG reads the public URL from the agent's local API — so when
+ngrok restarts and the URL changes, nothing needs updating.
 
-Then in the Airflow UI press ▶ on `index_on_kaggle`; the unindexed count in
-Telegram (`/stats`) and on the upload page drops when it lands. The DAG arrives
-**active**, not paused, so the button works immediately — and so the `*/15`
-schedule starts firing. Without a tunnel each run fails its first task with the
-commands above in the log; set `AEROSEARCH_SCHEDULE=` (empty) in `.env` for
-manual-only until your tunnel is permanent.
+Already have a tunnel (Cloudflare, Tailscale Funnel, a static ngrok domain)? Point
+it at `server:8000` and set `AEROSEARCH_PUBLIC_URL` instead; the ngrok container
+is then unnecessary.
 
-The webserver takes **~50 s** to answer on first boot: it waits for
-`airflow-init` to migrate the metadata tables and create the `admin` user
-(password from `AIRFLOW_ADMIN_PASSWORD`, default `admin`).
+#### Why one HTTP tunnel and not two TCP ones
 
-> **One honest caveat on credentials.** The generated notebook is pushed *private*,
-> but it carries the Postgres password and S3 keys in its source, because Kaggle has
-> no secrets API to provision (see [`gpu_pool/README.md`](gpu_pool/README.md)). For a
-> personal project that is a fair trade. If it stops being one: give the tunnel a
-> restricted Postgres role, and rotate the tunnel URL between runs rather than
-> treating the notebook as a secret.
+The notebook talks only to `/internal/*` on the retrieval server — it pulls
+pending rows, streams each media file, and posts vectors back. That means:
+
+- **Postgres is never exposed to the internet**, and its password never reaches a
+  notebook. The only secret the notebook carries is a bearer token scoped to those
+  three endpoints, which the server generates on first boot and shares with Airflow
+  through a volume — nothing to configure, and no default token to leak.
+- **One endpoint, not two**, which fits ngrok's 3-endpoint free cap with room
+  spare, and needs no credit-card verification (TCP endpoints do).
+- The server tells the notebook which model and revision to load, so the GPU side
+  cannot drift from the pinned contract. `/internal/embeddings` rejects a payload
+  whose fingerprint disagrees (409) and any vector of the wrong width.
 
 ### Running pieces outside Docker
 
