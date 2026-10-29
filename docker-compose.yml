@@ -1,174 +1,180 @@
-version: '3.8'
+# aerosearch — the whole stack.
+#
+#   docker compose up -d
+#
+# Every value below has a working default, so this starts on a clean machine with
+# no .env file at all. The single exception is API_KEY, your Telegram bot token,
+# which nobody can default for you:
+#
+#   echo 'API_KEY=123456:your-token-from-BotFather' > .env && docker compose up -d
+#
+# Four services start by default: postgres, minio (object storage), worker
+# (indexes what the bot ingests) and bot. Airflow is NOT started — the worker's
+# poll loop replaces it; bring it up with `--profile airflow` if you want the UI.
+#
+# Storage lives in NAMED VOLUMES, not host directories, and the Postgres volume
+# carries its major version in its name (pgdata-pg17). That is deliberate: a
+# Postgres data directory cannot be read by a different major version, so pinning
+# the version into the volume name means a future bump creates a fresh volume
+# instead of crashing with "database files are incompatible with server".
+
+# Shared settings for the two app services. They run the same image: the bot
+# and the worker both load EmbeddingGemma 2, so building twice would download
+# torch twice.
+x-app: &app
+  # One shared image name, so `bot` and `worker` build and store it once rather
+  # than twice -- it carries torch, so that matters.
+  image: aerosearch-app:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment: &app-env
+    DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-aerosearch}
+    MINIO_ENDPOINT: minio:8000
+    MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+    MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    MINIO_BUCKET: ${MINIO_BUCKET:-media}
+    AEROSEARCH_TABLE: ${AEROSEARCH_TABLE:-media}
+    # Pinned embedding contract lives in aerosearch/pinned.py; override only to
+    # roll back to e5 (a different vector space -- needs a re-embed).
+    AEROSEARCH_EMBED_BACKEND: ${AEROSEARCH_EMBED_BACKEND:-gemma2}
+  volumes:
+    # Model cache: EmbeddingGemma 2 is downloaded once, then reused across
+    # restarts and rebuilds by both services.
+    - hf-cache:/models
+  depends_on:
+    postgres: {condition: service_healthy}
+    minio: {condition: service_healthy}
+  restart: unless-stopped
+  networks: [app-network]
+
 services:
-  # S3-compatible object storage. Was minio/minio, which MinIO DELETED from Docker
-  # Hub on 2026-09-11 (Hub's own API returns "object not found" for every tag, and
-  # quay.io refuses anonymous pulls), so that compose file could no longer start.
-  # Zenko CloudServer is the replacement: verified drop-in for the `minio` Python
-  # SDK the bot uses (bucket_exists / make_bucket / put_object / get_object /
-  # list_objects all behave). Keeps the MINIO_* env names so .env and the client
-  # code are untouched.
+  # ---------------------------------------------------------------- storage ---
+  # S3-compatible object storage for the media itself.
+  #
+  # This is zenko/cloudserver rather than minio/minio because MinIO DELETED its
+  # Docker Hub images on 2026-09-11 (Hub's own API returns "object not found" for
+  # every tag; quay.io refuses anonymous pulls), so the old compose file could not
+  # start at all. CloudServer is a verified drop-in for the `minio` Python SDK the
+  # bot uses. The MINIO_* names are kept so the client code is untouched.
+  # It serves the S3 API only — there is no web console.
   minio:
     image: zenko/cloudserver:latest
-    ports:
-      - "9000:8000"  # S3 API (CloudServer listens on 8000 internally)
     environment:
-      # CloudServer's own names for the static credentials.
-      - SCALITY_ACCESS_KEY_ID=${MINIO_ROOT_USER}
-      - SCALITY_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
-      - S3BACKEND=file          # durable on disk; "mem" loses everything on restart
-      - REMOTE_MANAGEMENT_DISABLE=1
-      - ENDPOINT=minio
+      SCALITY_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      SCALITY_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      S3BACKEND: file            # durable; "mem" loses everything on restart
+      REMOTE_MANAGEMENT_DISABLE: "1"
+      ENDPOINT: minio
+    ports:
+      - "${MINIO_PORT:-9000}:8000"   # CloudServer listens on 8000 internally
     volumes:
-      - ./minio-data:/usr/src/app/localData
-      - ./minio-metadata:/usr/src/app/localMetadata
+      - minio-data:/usr/src/app/localData
+      - minio-metadata:/usr/src/app/localMetadata
     healthcheck:
       # Unauthenticated ListBuckets answers 403, which proves S3 is serving.
-      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/ | grep -qE '403|200'"]
-      interval: 10s
+      test: ["CMD-SHELL", "curl -sf -o /dev/null -w '%{http_code}' http://localhost:8000/ | grep -qE '403|200'"]
+      interval: 5s
       timeout: 5s
-      retries: 5
-    networks:
-      - app-network
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+    networks: [app-network]
 
+  # Postgres + pgvector. pgvector/pgvector is the project's own image; the
+  # previous ankane/pgvector is marked archived on Docker Hub.
   postgres:
-    # Was ankane/pgvector, which Docker Hub now reports as archived (unmaintained).
-    # pgvector/pgvector is the project's own image and is active.
     image: pgvector/pgvector:pg17
     environment:
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-aerosearch}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - ./postgres-data:/var/lib/postgresql/data
+      - pgdata-pg17:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
-      interval: 10s
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-aerosearch}"]
+      interval: 5s
       timeout: 5s
-      retries: 3
-    networks:
-      - app-network
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+    networks: [app-network]
 
-  airflow-webserver:
-    build: 
-      context: .
-      dockerfile: Dockerfile
-    # image: custom-airflow:2.9.3
-    depends_on:
-      postgres:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
+  # ------------------------------------------------------------ aerosearch ---
+  # Indexes rows the bot leaves pending. Replaces the Airflow DAG for normal use.
+  worker:
+    <<: *app
     environment:
-      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY}
-      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
-      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
-      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
-      - MINIO_BUCKET=${MINIO_BUCKET}
-      - TELEGRAM_BOT_TOKEN=${API_KEY}
-      - AIRFLOW__CORE__DAGS_FOLDER=/tmp/airflow/dags
-      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      <<: *app-env
+    command: ["aerosearch", "worker", "--interval", "${AEROSEARCH_POLL_SECONDS:-30}"]
+
+  # Telegram frontend: ingest + /search + /stats.
+  bot:
+    <<: *app
+    environment:
+      <<: *app-env
+      API_KEY: ${API_KEY:?Set your Telegram bot token, e.g. echo 'API_KEY=123456:token-from-BotFather' > .env}
+    working_dir: /app/bot
+    command: ["python", "bot.py"]
+
+  # --------------------------------------------------------------- airflow ---
+  # Optional. The worker above does the same indexing on a poll loop, so Airflow
+  # is only worth starting for its UI and scheduling:
+  #
+  #   docker compose --profile airflow up -d
+  #
+  # It needs AIRFLOW_FERNET_KEY set to a real key; generate one with
+  #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+  airflow-webserver:
+    profiles: [airflow]
+    build: {context: ., dockerfile: airflow.Dockerfile}
+    depends_on:
+      postgres: {condition: service_healthy}
+      minio: {condition: service_healthy}
+    environment: &airflow-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-aerosearch}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-aerosearch}
+      MINIO_ENDPOINT: minio:8000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-media}
     volumes:
-      - ./airflow/dags:/tmp/airflow/dags
-      - ./airflow/logs:/tmp/airflow/logs
-      - ./airflow/plugins:/tmp/airflow/plugins
-      - ./bot:/tmp/airflow/bot  # Share bot code for tasks
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow-logs:/opt/airflow/logs
+      - hf-cache:/models
     ports:
-      - "8080:8080"  # Airflow web UI
+      - "${AIRFLOW_PORT:-8080}:8080"
     command: webserver
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-    networks:
-      - app-network
+    restart: unless-stopped
+    networks: [app-network]
 
   airflow-scheduler:
-    build: 
-      context: .
-      dockerfile: Dockerfile
-    # image: custom-airflow:2.9.3
+    profiles: [airflow]
+    build: {context: ., dockerfile: airflow.Dockerfile}
     depends_on:
-      postgres:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
+      postgres: {condition: service_healthy}
     environment:
-      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY}
-      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
-      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
-      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
-      - MINIO_BUCKET=${MINIO_BUCKET}
-      - TELEGRAM_BOT_TOKEN=${API_KEY}
-      - AIRFLOW__CORE__DAGS_FOLDER=/tmp/airflow/dags
-      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      <<: *airflow-env
     volumes:
-      - ./airflow/dags:/tmp/airflow/dags
-      - ./airflow/logs:/tmp/airflow/logs
-      - ./airflow/plugins:/tmp/airflow/plugins
-      - ./bot:/tmp/airflow/bot
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow-logs:/opt/airflow/logs
+      - hf-cache:/models
     command: scheduler
-    healthcheck:
-      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --local"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-    networks:
-      - app-network
-
-  airflow-init:
-    build: 
-      context: .
-      dockerfile: Dockerfile
-    # image: custom-airflow:2.9.3
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY}
-      - TELEGRAM_BOT_TOKEN=${API_KEY}
-      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-    command:
-      bash -c "airflow db init && airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password ${AIRFLOW_ADMIN_PASSWORD}"
-    networks:
-      - app-network
-
-  bot:
-    build:
-      context: .
-      dockerfile: bot/Dockerfile
-    depends_on:
-      minio:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    env_file:
-      - .env
-    environment:
-      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
-      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
-      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
-      - MINIO_BUCKET=${MINIO_BUCKET}
-      - TELEGRAM_BOT_TOKEN=${API_KEY}
-      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-    networks:
-      - app-network
+    restart: unless-stopped
+    networks: [app-network]
 
 networks:
   app-network:
-    driver: bridge
 
 volumes:
   minio-data:
-  postgres-data:
-  airflow-dags:
+  minio-metadata:
+  # Major version is in the name on purpose -- see the note at the top.
+  pgdata-pg17:
+  hf-cache:
   airflow-logs:
-  airflow-plugins:

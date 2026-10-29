@@ -16,14 +16,16 @@ dependencies = [
 [project.optional-dependencies]
 # Bot query-side only: embed user queries with e5. No whisper/gemma.
 query = [
-    "sentence-transformers[image,audio]>=6.1.0",
-    "torchcodec>=0.3.0",
+    "sentence-transformers[image]>=6.1.0",
+    "librosa>=0.10",      # wav decoding for the audio encoder
+    "torchcodec>=0.3.0",  # audio inside mp4
 ]
 # Telegram frontend: aiogram + the query-side embedder + blob/db clients.
 bot = [
     "aiogram>=3.22",
-    "sentence-transformers[image,audio]>=6.1.0",
-    "torchcodec>=0.3.0",
+    "sentence-transformers[image]>=6.1.0",
+    "librosa>=0.10",      # wav decoding for the audio encoder
+    "torchcodec>=0.3.0",  # audio inside mp4
     "asyncpg>=0.29",
     "minio>=7.2",
 ]
@@ -34,8 +36,9 @@ cpu = [
     "transformers>=4.53",
     "accelerate>=0.30",
     "timm>=1.0",
-    "sentence-transformers[image,audio]>=6.1.0",
-    "torchcodec>=0.3.0",
+    "sentence-transformers[image]>=6.1.0",
+    "librosa>=0.10",      # wav decoding for the audio encoder
+    "torchcodec>=0.3.0",  # audio inside mp4
     "faster-whisper>=1.0",
 ]
 # CUDA/T4 path adds 4-bit quantization for the Gemma 3 4B captioner.
@@ -45,11 +48,24 @@ gpu = [
     "accelerate>=0.30",
     "bitsandbytes>=0.43",
     "timm>=1.0",
-    "sentence-transformers[image,audio]>=6.1.0",
-    "torchcodec>=0.3.0",
+    "sentence-transformers[image]>=6.1.0",
+    "librosa>=0.10",      # wav decoding for the audio encoder
+    "torchcodec>=0.3.0",  # audio inside mp4
     "faster-whisper>=1.0",
 ]
 db = [
+    "asyncpg>=0.29",
+    "minio>=7.2",
+]
+# Everything the containers need, and nothing else: the Telegram frontend, the
+# multimodal embedder, and the db/blob clients. Deliberately excludes
+# faster-whisper / transformers / timm -- those are only for `--enrich`, which the
+# baseline does not use, and they would roughly double the image.
+app = [
+    "aiogram>=3.22",
+    "sentence-transformers[image]>=6.1.0",
+    "librosa>=0.10",      # wav decoding for the audio encoder
+    "torchcodec>=0.3.0",  # audio inside mp4
     "asyncpg>=0.29",
     "minio>=7.2",
 ]

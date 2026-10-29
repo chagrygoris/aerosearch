@@ -29,6 +29,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("API_KEY")
+if not BOT_TOKEN:
+    # Fail with the fix rather than aiogram's opaque validation error.
+    raise SystemExit(
+        "API_KEY is not set — that's your Telegram bot token from @BotFather.\n"
+        "  docker: echo 'API_KEY=123456:your-token' > .env && docker compose up -d\n"
+        "  local : export API_KEY=123456:your-token"
+    )
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 

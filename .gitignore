@@ -22,3 +22,4 @@ kaggle*.json
 *_tokens_*/
 pool_tokens/
 minio-metadata/
+.localca/

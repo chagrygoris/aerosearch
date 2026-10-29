@@ -93,114 +93,82 @@ python scripts/kaggle_index.py --media src-videos --out index/store --whisper la
 
 Gemma 3 is gated on Hugging Face — set `HF_TOKEN` before downloading.
 
-## Running locally
+## Running it
 
-First, create your env file:
-
-```bash
-cp .env.example .env          # then edit: put your Telegram token in API_KEY
-```
-
-`config.py` is host/container aware: containers use `DATABASE_URL` (host
-`postgres`) and `MINIO_ENDPOINT` (`minio:9000`); host/venv runs automatically
-switch to `LOCAL_DATABASE_URL` and `localhost:9000`. The same `.env` works for both.
-
-### Path A — lightweight (recommended to try first)
-
-Run only the infra in Docker; run the bot from your venv. No Airflow, no gated
-Gemma download — you index manually and watch data land.
+One command, on any machine with Docker. The only thing nobody can default for
+you is your Telegram bot token from [@BotFather](https://t.me/botfather):
 
 ```bash
-# 0) Install the bot deps (aiogram + embedder + db/blob clients) into the venv
-uv pip install --python .venv -e ".[bot]"
-
-# 1) Start MinIO + Postgres only
-docker compose up -d minio postgres
-
-# 2) Run the bot on the host (uses LOCAL_DATABASE_URL + localhost MinIO)
-cd bot && ../.venv/bin/python bot.py        # logs stream to this terminal
+echo 'API_KEY=123456:your-token-from-BotFather' > .env
+docker compose up -d
 ```
 
-Now DM your bot (or add it to a group) and send a photo/video/text. Each lands in
-MinIO + a *pending* Postgres row. A third terminal drains those rows:
+That starts four services — `postgres`, `minio` (object storage), `worker` and
+`bot` — and nothing else needs configuring: every other value has a working
+default in `docker-compose.yml`, so **no `.env` beyond the token is required**.
+First start downloads EmbeddingGemma 2 (~1.5 GB) into a named volume, so it
+happens once rather than per restart.
 
 ```bash
-# 3) Understand + embed pending rows, on a 60s poll loop
-.venv/bin/aerosearch worker                 # Ctrl-C to stop
-.venv/bin/aerosearch worker --once          # single pass, then exit
+docker compose logs -f bot worker     # follow both
+docker compose down                   # stop; add -v to wipe data too
 ```
 
-`worker` is the local stand-in for the Airflow DAG — same `BatchIndexer`, driven by
-a poll loop instead of a scheduler, so nothing but Postgres and MinIO needs to run.
+Then DM the bot a photo, video or message and `/search` for it. `/stats` shows
+how much is indexed versus still queued — ingest and indexing are separate
+processes, so a just-sent clip becomes searchable on the worker's next poll
+(30 s by default, `AEROSEARCH_POLL_SECONDS`).
 
-**No captioner and no Whisper by default.** EmbeddingGemma 2 embeds the media file
-itself, so a photo is findable without a caption and a spoken clip without a
-transcript. Measured end to end on CPU with `NullCaptioner` + `NullTranscriber`,
-4/4 on a mixed set of photos and clips:
+> **In a group chat, Telegram delivers nothing to the bot by default.** Privacy
+> mode means it only sees slash commands and replies to itself. Either DM it, or
+> run `/setprivacy` → *Disable* in @BotFather and re-add it to the group.
 
-| query | retrieved | score |
+### What runs where
+
+| Service | Image | Notes |
 |---|---|---|
-| `a cat sleeping on a sofa` | the clip whose *speech* says so | 0.756 |
-| `speech about the government` | the other spoken clip | 0.776 |
-| `политик Си Цзиньпинь` | the image with that Cyrillic text in it | 0.707 |
-| `colour bars test card` | the silent clip | 0.742 |
+| `postgres` | `pgvector/pgvector:pg17` | vectors + rows; volume `pgdata-pg17` |
+| `minio` | `zenko/cloudserver` | S3 API on `localhost:9000`, no web console |
+| `worker` | built from `Dockerfile` | indexes pending rows on a poll loop |
+| `bot` | same image | ingest, `/search`, `/stats` |
 
-`--enrich` adds the captioner and Whisper back. That buys *readable* text in
-`document` and may retrieve specific phrasing better than a 768-float summary of the
-audio — worth measuring, but it is not needed for retrieval to work, and both models
-want a GPU to be practical.
+`worker` and `bot` share one image (`aerosearch-app:local`) because both load the
+same embedder — building separately would download torch twice.
 
-⚠️ **Throughput on CPU is the real constraint.** Indexing 4 short files took **216 s**
-(~54 s/file, including model load) on this container's CPU. Video is the expensive
-part. sentence-transformers also warns that the model loads in `bfloat16` on CPU and
-that `float32` may be significantly faster there — untested, and worth trying on the
-Mac before concluding local indexing is too slow.
-
-Then search from Telegram with `/search <query>`.
-
-### Path B — full stack (bot + Airflow + batch worker)
+**Airflow is not started.** The `worker` poll loop does the same indexing without
+a scheduler, a metadata DB or a Fernet key. If you want its UI anyway:
 
 ```bash
-docker compose up -d --build      # minio, postgres, airflow (web+scheduler), bot
-docker compose logs -f bot        # follow bot logs
+docker compose --profile airflow up -d     # needs AIRFLOW_FERNET_KEY set
 ```
 
-⚠️ The Airflow worker downloads **Gemma 3n** (gated) on its first run — set
-`HF_TOKEN` in `.env` and expect a large first-run download. The
-`index_pending_media` DAG runs every 15 min; trigger it manually from the UI to
-index immediately.
+### Two infrastructure notes
 
-### Where to observe things
+- **Postgres volumes carry their major version** (`pgdata-pg17`). A data directory
+  cannot be read by a different major Postgres, so pinning the version into the
+  volume name means a future bump creates a fresh volume instead of crashing with
+  *"database files are incompatible with server"*. Nothing to remember.
+- **The torch stack comes entirely from PyPI, in one `pip install`.** Splitting it
+  across indexes (a `+cpu` torch from download.pytorch.org, torchvision from PyPI)
+  produces wheels that import and then fail with *"operator torchvision::nms does
+  not exist"*, which surfaces far away as transformers failing to import
+  `PreTrainedModel`. The CPU index is not an option because it does not carry
+  `torchcodec`. On arm64, including Apple Silicon, the PyPI wheels are CPU-only
+  anyway; on amd64 this costs ~2 GB of unused CUDA libraries.
 
-| What | Where | Notes |
-|---|---|---|
-| **Bot logs** | terminal (Path A) or `docker compose logs -f bot` | shows "queued photo/video/text" per ingest |
-| **Media files** | `./minio-data/` on disk, or any S3 client against `localhost:9000` | CloudServer has no web console; the objects are plain files under `minio-data/` |
-| **Saved messages/rows** | Postgres `media` table | `docker compose exec postgres psql -U postgres -d aerosearch -c "select media_id, media_type, user_name, left(document,60), (embedding is not null) as indexed from media order by media_id desc limit 20;"` |
-| **Airflow UI + task logs** | http://localhost:8080 | log in `admin` / `AIRFLOW_ADMIN_PASSWORD`; DAG `index_pending_media`; click a run → task → Logs |
-| **Airflow log files** | `airflow/logs/` on disk | mounted from the scheduler/worker |
+### Running the bot outside Docker
 
-Stop everything: `docker compose down` (add `-v` to also wipe MinIO/Postgres data).
+```bash
+uv venv --python 3.12 .venv
+uv pip install --python .venv -e ".[app]"
+docker compose up -d postgres minio        # infra only
+export API_KEY=123456:your-token
+cd bot && ../.venv/bin/python bot.py       # terminal 2
+.venv/bin/aerosearch worker                # terminal 3
+```
 
-> **Object storage note:** the `minio` service runs **`zenko/cloudserver`**, not
-> `minio/minio` — MinIO deleted those images from Docker Hub on 2026-09-11 (Hub's own
-> API returns "object not found" for every tag; quay.io refuses anonymous pulls), so
-> the old compose file could not start at all. CloudServer is a verified drop-in for
-> the `minio` Python SDK the bot uses, and the `MINIO_*` variables in `.env` are
-> unchanged. It exposes the S3 API on `localhost:9000` and has **no web console**.
->
-> **Postgres note:** the image is **`pgvector/pgvector:pg17`** (the project's own,
-> active) rather than `ankane/pgvector`, which Docker Hub reports as *archived*. That
-> moves Postgres 15 → 17, and **data directories are not compatible across major
-> versions**, so an existing `postgres-data/` must be wiped: `docker compose down -v`.
-> The embedding contract change forces a re-embed anyway, so nothing extra is lost.
->
-> **Schema note:** the embedding column width follows the pinned contract —
-> legacy was `vector(1536)`, e5-large was **1024**, EmbeddingGemma 2 is **768**.
-> `init()` now checks the existing column and refuses with a clear message rather
-> than failing later on insert. On a fresh DB the store creates the right schema. If you hit a
-> dimension error on an existing volume, drop the table (or `docker compose down
-> -v`) and let it recreate.
+`config.py` is host/container aware: containers use `DATABASE_URL` and reach S3 at
+`minio:8000`, while host runs switch to `LOCAL_DATABASE_URL` and `localhost:9000`.
 
 ## Accelerator pool
 
